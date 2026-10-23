@@ -478,14 +478,22 @@ impl WebDriverBackend {
     /// one trusted insertText, so long text takes a fraction of a second.
     pub async fn insert_value(&self, element_id: &str, text: &str) -> Result<(), String> {
         self.ensure_idle().await?;
-        let budget = budget_for(text.chars().count(), None);
-        self.within_input_budget(budget, |deadline| async move {
-            self.client
-                .send_keys_within(element_id, text, remaining(deadline))
-                .await
-                .map_err(|e| self.input_error(e, budget, None))
-        })
-        .await
+        let total = text.chars().count();
+        let budget = budget_for(total, None);
+        let before = self.text_len(element_id).await;
+        let result = self
+            .within_input_budget(budget, |deadline| async move {
+                self.client
+                    .send_keys_within(element_id, text, remaining(deadline))
+                    .await
+            })
+            .await;
+        match result {
+            Err(e) => Err(self
+                .input_error(e, budget, total, before.map(|b| (element_id, b)))
+                .await),
+            ok => ok,
+        }
     }
 
     /// Type `text` as real key presses: one keyDown/keyUp per character
@@ -501,39 +509,66 @@ impl WebDriverBackend {
         delay: Option<std::time::Duration>,
     ) -> Result<(), String> {
         self.ensure_idle().await?;
-        if let Some(el) = element_id {
-            self.execute_function_body(FOCUS_AT_END_JS, vec![super::dom_refs::element_arg(el)])
-                .await?;
-        }
+        // The element the keys go to, to count what was typed if it stops.
+        let target = match element_id {
+            Some(el) => {
+                self.execute_function_body(FOCUS_AT_END_JS, vec![super::dom_refs::element_arg(el)])
+                    .await?;
+                Some(el.to_string())
+            }
+            None => self.focused_element().await.ok(),
+        };
+        let before = match target.as_deref() {
+            Some(el) => self.text_len(el).await,
+            None => None,
+        };
         let chars: Vec<char> = text.chars().collect();
         let total = chars.len();
         let budget = budget_for(total, delay);
-        self.within_input_budget(budget, |deadline| async move {
-            let Some(delay) = delay else {
-                return self
-                    .client
-                    .execute_actions_within(&key_actions(&chars), remaining(deadline))
-                    .await
-                    .map_err(|e| self.input_error(e, budget, None));
-            };
-            for (sent, ch) in chars.iter().enumerate() {
-                if std::time::Instant::now() + TYPING_MARGIN >= deadline {
-                    return Err(format!(
-                        "Typing stopped after {} of {} characters: it did not finish within {}s. Nothing more is sent; check the field's value before typing the rest",
-                        sent,
-                        total,
-                        budget.as_secs_f32()
-                    ));
+        let chars = &chars;
+        let result = self
+            .within_input_budget(budget, |deadline| async move {
+                let Some(delay) = delay else {
+                    return self
+                        .client
+                        .execute_actions_within(&key_actions(chars), remaining(deadline))
+                        .await;
+                };
+                for ch in chars {
+                    if std::time::Instant::now() + TYPING_MARGIN >= deadline {
+                        // Our own deadline: reported like the driver's.
+                        return Err("WebDriver timeout (budget): typing budget spent".to_string());
+                    }
+                    self.client
+                        .execute_actions_within(&key_actions(&[*ch]), remaining(deadline))
+                        .await?;
+                    tokio::time::sleep(delay).await;
                 }
-                self.client
-                    .execute_actions_within(&key_actions(&[*ch]), remaining(deadline))
-                    .await
-                    .map_err(|e| self.input_error(e, budget, Some((sent, total))))?;
-                tokio::time::sleep(delay).await;
+                Ok(())
+            })
+            .await;
+        match result {
+            Err(e) => {
+                let measure = target.as_deref().zip(before);
+                Err(self.input_error(e, budget, total, measure).await)
             }
-            Ok(())
-        })
+            ok => ok,
+        }
+    }
+
+    /// The text length of an input, textarea or contenteditable element in
+    /// characters (code points, like Rust's `chars()`); `None` for others.
+    async fn text_len(&self, element_id: &str) -> Option<usize> {
+        self.execute_function_body(
+            "var e = arguments[0];
+             var v = typeof e.value === 'string' ? e.value : (e.isContentEditable ? e.innerText : null);
+             return v == null ? null : Array.from(v).length;",
+            vec![super::dom_refs::element_arg(element_id)],
+        )
         .await
+        .ok()?
+        .as_u64()
+        .map(|n| n as usize)
     }
 
     /// Run one input call within `budget`: the driver's session script
@@ -568,25 +603,34 @@ impl WebDriverBackend {
         result
     }
 
-    fn input_error(
+    /// The error for a failed input call. `measure` is the target element
+    /// and its text length before the call, to count what was typed.
+    async fn input_error(
         &self,
         error: String,
         budget: std::time::Duration,
-        progress: Option<(usize, usize)>,
+        total: usize,
+        measure: Option<(&str, usize)>,
     ) -> String {
-        let typed = match progress {
-            Some((sent, total)) => format!(" after {} of {} characters", sent, total),
-            None => String::new(),
-        };
-        // The driver stopped sending keys at its deadline; it stays usable.
-        // Keys it already posted to the page (one batch, at most 16 on
-        // webkit-cli 0.7.1) can still arrive after it answers.
+        // The driver stopped at the deadline. webkit-cli 0.7.2 answers only
+        // once the keys it already posted have reached the page, so the
+        // field is final now; it stays usable.
         if error.starts_with("WebDriver timeout ") {
+            let typed = match measure {
+                Some((el, before)) => self
+                    .text_len(el)
+                    .await
+                    .map(|after| after.saturating_sub(before)),
+                None => None,
+            };
+            let stopped = match typed {
+                Some(n) => format!("Typing stopped after {} of {} characters", n, total),
+                None => format!("Typing stopped before all {} characters were typed", total),
+            };
             return format!(
-                "Typing stopped{}: it did not finish within {}s, and {} stopped sending keys; up to one batch (16 keys or fewer) already sent may still arrive. Wait a moment and check the field's value before typing the rest; for long text use fill",
-                typed,
-                budget.as_secs_f32(),
-                self.label
+                "{}: it did not finish within {}s. The field holds exactly what was typed; continue from there, or for long text use fill",
+                stopped,
+                budget.as_secs_f32()
             );
         }
         // No answer at all: the driver may still be working on it.

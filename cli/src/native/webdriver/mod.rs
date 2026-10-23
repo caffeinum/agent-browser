@@ -12,8 +12,8 @@ pub mod webkit;
 
 /// How long typing `chars` characters may take on a WebDriver session: 20s
 /// plus 20ms a character (webkit-cli 0.7.1 measured about 2ms a key). It is
-/// the session script timeout for the call, at which webkit-cli stops sending
-/// keys (one batch already posted, 16 or fewer, can still arrive).
+/// the session script timeout for the call, at which webkit-cli stops input;
+/// 0.7.2 answers once the keys it posted have landed, so the field is final.
 pub fn typing_budget_ms(chars: usize) -> u64 {
     20_000u64.saturating_add((chars as u64).saturating_mul(20))
 }

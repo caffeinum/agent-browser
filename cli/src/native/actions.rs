@@ -17148,7 +17148,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         ]);
         guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
-        guard.set("FAKE_WD_VERSION", "webkit-cli 0.7.0");
+        guard.set("FAKE_WD_VERSION", "webkit-cli 0.7.1");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("launches.log");
         let bin = fake_webkit_cli(dir.path(), &log);
@@ -17164,8 +17164,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         )
         .await
         .unwrap_err();
-        assert!(err.contains("webkit-cli 0.7.0"), "{}", err);
-        assert!(err.contains("needs 0.7.1 or later"), "{}", err);
+        assert!(err.contains("webkit-cli 0.7.1"), "{}", err);
+        assert!(err.contains("needs 0.7.2 or later"), "{}", err);
         assert!(!log.exists(), "an old webkit-cli must not be started");
     }
 
@@ -17628,9 +17628,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         close_all_browser_backends(&mut state).await.unwrap();
     }
 
-    /// E: webkit-cli 0.7.1 stops typing at the session script timeout, drops
-    /// the keys it has not sent and answers `timeout`; the error says nothing
-    /// more is typed, and the session stays usable (no busy state).
+    /// F: webkit-cli 0.7.2 stops typing at the session script timeout and
+    /// answers `timeout` once the keys it posted have landed, so the field is
+    /// final: the error counts what was typed (from the field's length before
+    /// and after), and the session stays usable (no busy state).
     #[cfg(unix)]
     #[tokio::test]
     async fn test_webkit_typing_stopped_by_the_driver_is_reported() {
@@ -17660,7 +17661,19 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert_eq!(typed["success"], false, "{}", typed);
         assert_eq!(
             typed["error"],
-            "Typing stopped: it did not finish within 24s, and webkit-cli stopped sending keys; up to one batch (16 keys or fewer) already sent may still arrive. Wait a moment and check the field's value before typing the rest; for long text use fill"
+            "Typing stopped after 64 of 200 characters: it did not finish within 24s. The field holds exactly what was typed; continue from there, or for long text use fill"
+        );
+
+        // fill clears first, so the count starts from an empty field.
+        let filled = execute_command(
+            &json!({ "id": "f", "action": "fill", "selector": "#t", "value": "z".repeat(300) }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(filled["success"], false, "{}", filled);
+        assert_eq!(
+            filled["error"],
+            "Typing stopped after 64 of 300 characters: it did not finish within 26s. The field holds exactly what was typed; continue from there, or for long text use fill"
         );
         let next = execute_command(&launch, &mut state).await;
         assert_eq!(next["success"], true, "{}", next);
