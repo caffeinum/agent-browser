@@ -26,7 +26,7 @@ pub fn find_safaridriver() -> Option<PathBuf> {
     None
 }
 
-pub fn launch_safaridriver(port: u16) -> Result<DriverProcess, String> {
+pub async fn launch_safaridriver(port: u16) -> Result<DriverProcess, String> {
     let driver_path = find_safaridriver()
         .ok_or("safaridriver not found. Safari WebDriver requires macOS with Safari.")?;
 
@@ -37,6 +37,7 @@ pub fn launch_safaridriver(port: u16) -> Result<DriverProcess, String> {
         port,
         DEFAULT_READY_TIMEOUT,
     )
+    .await
     .map_err(|e| {
         format!(
             "{}\nIf safaridriver reports that remote automation is off, run `safaridriver --enable` once (or enable Develop > Allow Remote Automation in Safari).",

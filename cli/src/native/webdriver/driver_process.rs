@@ -3,9 +3,13 @@
 //! The driver's stdout and stderr are drained into a bounded buffer so that a
 //! driver that exits or never opens its port produces an error carrying its
 //! own diagnostics instead of a bare "Connection refused".
+//!
+//! Waiting never blocks a tokio worker: readiness and shutdown poll with
+//! `tokio::time::sleep`, and `Drop` hands any remaining wait to a detached
+//! thread.
 
 use std::io::Read;
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -17,16 +21,17 @@ const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct DriverProcess {
-    child: Child,
+    /// `None` only after shutdown or drop has taken ownership of the child.
+    child: Option<Child>,
     pub port: u16,
     name: String,
     output: Arc<Mutex<String>>,
 }
 
 impl DriverProcess {
-    /// Spawn `program args...` and block until it accepts TCP connections on
+    /// Spawn `program args...` and wait until it accepts TCP connections on
     /// `port`, it exits, or `ready_timeout` elapses.
-    pub fn spawn(
+    pub async fn spawn(
         name: &str,
         program: &Path,
         args: &[String],
@@ -50,22 +55,22 @@ impl DriverProcess {
         }
 
         let mut process = Self {
-            child,
+            child: Some(child),
             port,
             name: name.to_string(),
             output,
         };
-        process.wait_until_ready(ready_timeout)?;
+        process.wait_until_ready(ready_timeout).await?;
         Ok(process)
     }
 
-    fn wait_until_ready(&mut self, timeout: Duration) -> Result<(), String> {
+    async fn wait_until_ready(&mut self, timeout: Duration) -> Result<(), String> {
         let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(status) = self.child.try_wait().map_err(|e| e.to_string())? {
+            if let Some(status) = self.try_exit_status()? {
                 // Give the drain threads a moment to collect the final lines.
-                std::thread::sleep(POLL_INTERVAL);
+                tokio::time::sleep(POLL_INTERVAL).await;
                 return Err(format!(
                     "{} exited ({}) before accepting connections on port {}{}",
                     self.name,
@@ -74,20 +79,28 @@ impl DriverProcess {
                     self.output_suffix()
                 ));
             }
-            if TcpStream::connect_timeout(&addr, POLL_INTERVAL).is_ok() {
+            let probe = tokio::time::timeout(POLL_INTERVAL, tokio::net::TcpStream::connect(addr));
+            if matches!(probe.await, Ok(Ok(_))) {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                self.kill();
+                self.shutdown().await;
                 return Err(format!(
                     "{} did not accept connections on port {} within {}s{}",
                     self.name,
                     self.port,
-                    timeout.as_secs(),
+                    timeout.as_secs_f32(),
                     self.output_suffix()
                 ));
             }
-            std::thread::sleep(POLL_INTERVAL);
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    fn try_exit_status(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+        match self.child.as_mut() {
+            Some(child) => child.try_wait().map_err(|e| e.to_string()),
+            None => Err(format!("{} was already shut down", self.name)),
         }
     }
 
@@ -108,34 +121,60 @@ impl DriverProcess {
 
     /// SIGTERM first so drivers can persist state (webkit-cli saves cookies on
     /// exit), then SIGKILL if the driver does not exit in time.
-    pub fn kill(&mut self) {
-        if matches!(self.child.try_wait(), Ok(Some(_))) {
+    pub async fn shutdown(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if matches!(child.try_wait(), Ok(Some(_))) {
             return;
         }
-        #[cfg(unix)]
-        {
-            if let Ok(pid) = i32::try_from(self.child.id()) {
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
+        send_sigterm(&child);
+        let deadline = Instant::now() + GRACEFUL_EXIT_TIMEOUT;
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
             }
-            let deadline = Instant::now() + GRACEFUL_EXIT_TIMEOUT;
-            while Instant::now() < deadline {
-                if matches!(self.child.try_wait(), Ok(Some(_))) {
-                    return;
-                }
-                std::thread::sleep(POLL_INTERVAL);
-            }
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = child.kill();
+        // SIGKILL has been sent, so this reap returns promptly.
+        let _ = tokio::task::spawn_blocking(move || child.wait()).await;
     }
 }
 
 impl Drop for DriverProcess {
+    /// Drop cannot await, so the graceful-exit wait moves to a detached thread.
     fn drop(&mut self) {
-        self.kill();
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        send_sigterm(&child);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + GRACEFUL_EXIT_TIMEOUT;
+            while Instant::now() < deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        });
     }
+}
+
+fn send_sigterm(child: &Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(child.id()) {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = child;
 }
 
 fn drain_into<R: Read + Send + 'static>(mut reader: R, sink: Arc<Mutex<String>>) {
@@ -173,13 +212,18 @@ pub fn pick_free_port() -> Result<u16, String> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn sh(script: &str) -> Vec<String> {
         vec!["-c".to_string(), script.to_string()]
     }
 
-    #[test]
-    fn early_exit_surfaces_stderr() {
+    fn pid_alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[tokio::test]
+    async fn early_exit_surfaces_stderr() {
         let port = pick_free_port().unwrap();
         let err = DriverProcess::spawn(
             "fake-driver",
@@ -188,14 +232,15 @@ mod tests {
             port,
             Duration::from_secs(5),
         )
+        .await
         .err()
         .expect("driver that exits must fail");
         assert!(err.contains("fake-driver exited"), "got: {}", err);
         assert!(err.contains("unknown flag --port"), "got: {}", err);
     }
 
-    #[test]
-    fn timeout_surfaces_output_and_kills_driver() {
+    #[tokio::test]
+    async fn timeout_surfaces_output_and_kills_driver() {
         let port = pick_free_port().unwrap();
         let started = Instant::now();
         let err = DriverProcess::spawn(
@@ -205,6 +250,7 @@ mod tests {
             port,
             Duration::from_millis(400),
         )
+        .await
         .err()
         .expect("driver that never listens must time out");
         assert!(err.contains("did not accept connections"), "got: {}", err);
@@ -212,16 +258,16 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
-    #[test]
-    fn ready_once_port_accepts_and_sigterm_stops_it() {
+    #[tokio::test]
+    async fn ready_once_port_accepts_and_sigterm_stops_it() {
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
         let port = pick_free_port().unwrap();
         let script = format!(
             "sleep 0.3; exec python3 -c 'import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((\"127.0.0.1\",{})); s.listen(); time.sleep(60)'",
             port
         );
-        if Command::new("python3").arg("--version").output().is_err() {
-            return;
-        }
         let mut driver = DriverProcess::spawn(
             "listening-driver",
             Path::new("/bin/sh"),
@@ -229,13 +275,77 @@ mod tests {
             port,
             Duration::from_secs(10),
         )
+        .await
         .expect("driver should become ready");
+        let pid = driver.child.as_ref().unwrap().id() as i32;
         let started = Instant::now();
-        driver.kill();
-        assert!(matches!(driver.child.try_wait(), Ok(Some(_))));
+        driver.shutdown().await;
+        assert!(!pid_alive(pid), "driver must be reaped after shutdown");
         assert!(
             started.elapsed() < GRACEFUL_EXIT_TIMEOUT,
             "SIGTERM should stop the driver without waiting for SIGKILL"
         );
+    }
+
+    /// On a single-threaded runtime, a blocking wait would starve every other
+    /// task for the whole readiness window.
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_for_readiness_does_not_block_the_runtime() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let port = pick_free_port().unwrap();
+        let _ = DriverProcess::spawn(
+            "slow-driver",
+            Path::new("/bin/sh"),
+            &sh("exec sleep 30"),
+            port,
+            Duration::from_millis(500),
+        )
+        .await;
+        ticker.abort();
+        assert!(
+            ticks.load(Ordering::SeqCst) >= 5,
+            "other tasks should keep running while the driver boots"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_returns_immediately_and_still_kills_a_stubborn_driver() {
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let port = pick_free_port().unwrap();
+        // Ignores SIGTERM, so only the SIGKILL fallback can stop it.
+        let script = format!(
+            "trap '' TERM; exec python3 -c 'import signal,socket,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((\"127.0.0.1\",{})); s.listen(); time.sleep(60)'",
+            port
+        );
+        let driver = DriverProcess::spawn(
+            "stubborn-driver",
+            Path::new("/bin/sh"),
+            &sh(&script),
+            port,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("driver should become ready");
+        let pid = driver.child.as_ref().unwrap().id() as i32;
+        let started = Instant::now();
+        drop(driver);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "drop must not wait for the driver to exit"
+        );
+        let deadline = Instant::now() + GRACEFUL_EXIT_TIMEOUT + Duration::from_secs(3);
+        while pid_alive(pid) && Instant::now() < deadline {
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        assert!(!pid_alive(pid), "SIGKILL fallback must stop the driver");
     }
 }

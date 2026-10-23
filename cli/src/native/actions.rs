@@ -2657,7 +2657,7 @@ pub(crate) async fn close_all_browser_backends(state: &mut DaemonState) -> Resul
     }
     state.appium = None;
     if let Some(ref mut driver) = state.webdriver_process {
-        driver.kill();
+        driver.shutdown().await;
     }
     state.webdriver_process = None;
     state.backend_type = BackendType::Cdp;
@@ -5528,7 +5528,7 @@ async fn launch_safari(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .port()
     };
 
-    let driver = safari::launch_safaridriver(actual_port)?;
+    let driver = safari::launch_safaridriver(actual_port).await?;
     let mut client = super::webdriver::client::WebDriverClient::new(actual_port);
 
     client
