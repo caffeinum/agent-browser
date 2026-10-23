@@ -1,24 +1,7 @@
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::process::Command;
 
-pub struct SafariDriverProcess {
-    child: Child,
-    pub port: u16,
-}
-
-impl SafariDriverProcess {
-    pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for SafariDriverProcess {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
+use super::driver_process::{DriverProcess, DEFAULT_READY_TIMEOUT};
 
 pub fn find_safaridriver() -> Option<PathBuf> {
     let candidates = ["/usr/bin/safaridriver"];
@@ -43,23 +26,23 @@ pub fn find_safaridriver() -> Option<PathBuf> {
     None
 }
 
-pub fn launch_safaridriver(port: u16) -> Result<SafariDriverProcess, String> {
+pub fn launch_safaridriver(port: u16) -> Result<DriverProcess, String> {
     let driver_path = find_safaridriver()
         .ok_or("safaridriver not found. Safari WebDriver requires macOS with Safari.")?;
 
-    let child = Command::new(&driver_path)
-        .arg("--port")
-        .arg(port.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to launch safaridriver: {}", e))?;
-
-    // Wait for driver to be ready
-    std::thread::sleep(Duration::from_millis(500));
-
-    Ok(SafariDriverProcess { child, port })
+    DriverProcess::spawn(
+        "safaridriver",
+        &driver_path,
+        &["--port".to_string(), port.to_string()],
+        port,
+        DEFAULT_READY_TIMEOUT,
+    )
+    .map_err(|e| {
+        format!(
+            "{}\nIf safaridriver reports that remote automation is off, run `safaridriver --enable` once (or enable Develop > Allow Remote Automation in Safari).",
+            e
+        )
+    })
 }
 
 #[cfg(test)]
