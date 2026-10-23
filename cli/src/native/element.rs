@@ -1126,12 +1126,39 @@ fn box_model_center(model: &BoxModel) -> (f64, f64) {
     }
 }
 
+/// Rendered text of `this` with each visible `a[href]` rewritten inline as
+/// `[label](absolute-href)`. Anchors are matched against the element's innerText
+/// in document order, so hidden or `javascript:` anchors stay plain text and the
+/// page DOM is never mutated.
+const TEXT_WITH_LINKS_JS: &str = r#"function() {
+  const text = this.innerText || this.textContent || '';
+  const anchors = [];
+  if (this.matches && this.matches('a[href]')) anchors.push(this);
+  if (this.querySelectorAll) anchors.push(...this.querySelectorAll('a[href]'));
+  let out = '';
+  let cursor = 0;
+  for (const a of anchors) {
+    if (a.getClientRects().length === 0) continue;
+    const label = (a.innerText || '').trim();
+    const href = a.href;
+    if (!label || !href || /^javascript:/i.test(href)) continue;
+    const at = text.indexOf(label, cursor);
+    if (at < 0) continue;
+    const md = label.replace(/\s+/g, ' ').replace(/([\[\]])/g, '\\$1');
+    const url = href.replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/\s/g, '%20');
+    out += text.slice(cursor, at) + '[' + md + '](' + url + ')';
+    cursor = at + label.length;
+  }
+  return out + text.slice(cursor);
+}"#;
+
 pub async fn get_element_text(
     client: &CdpClient,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
+    links: bool,
 ) -> Result<String, String> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
@@ -1142,12 +1169,16 @@ pub async fn get_element_text(
     )
     .await?;
 
+    let function_declaration = if links {
+        TEXT_WITH_LINKS_JS
+    } else {
+        "function() { return this.innerText || this.textContent || ''; }"
+    };
     let result: EvaluateResult = client
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration:
-                    "function() { return this.innerText || this.textContent || ''; }".to_string(),
+                function_declaration: function_declaration.to_string(),
                 object_id: Some(object_id),
                 arguments: None,
                 return_by_value: Some(true),

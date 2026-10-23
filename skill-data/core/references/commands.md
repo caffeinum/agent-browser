@@ -87,7 +87,11 @@ Clicks fail before dispatch when another element covers the target's click point
 ## Get Information
 
 ```bash
-agent-browser get text @e1        # Get element text
+agent-browser get text @e1        # Get element text (capped at 50000 chars)
+agent-browser get text body --max-chars 8000              # Smaller cap
+agent-browser get text body --max-chars 8000 --offset 8000  # Next part
+agent-browser get text main --links   # Inline links as [text](href)
+agent-browser get text body --max-chars 0 > page.txt      # Full text, no cap
 agent-browser get html @e1        # Get innerHTML
 agent-browser get value @e1       # Get input value
 agent-browser get attr @e1 href   # Get attribute
@@ -98,6 +102,8 @@ agent-browser get count ".item"   # Count matching elements
 agent-browser get box @e1         # Get bounding box
 agent-browser get styles @e1      # Get computed styles (font, color, bg, etc.)
 ```
+
+`get text` returns at most 50,000 characters by default, so `get text body` on a long page cannot flood an agent's context. When the text is cut, it ends with a `[truncated: ...]` marker that names how many characters were omitted and the `--offset` that fetches the next part. Use `--max-chars <n>` to pick a different cap, `--max-chars 0` for the full text (the behavior before the cap existed), `--offset <n>` to page through, and `--links` to render visible links inline as `[text](href)` with absolute URLs. With `--json`, the response also carries `totalChars`, `offset`, `truncated`, and `nextOffset`. When the selector matches no element (for example `get text article` on a page without `<article>`), the command fails with an error that names the selector and page; it never falls back to another element.
 
 ## Check State
 

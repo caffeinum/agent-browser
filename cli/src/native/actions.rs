@@ -6844,16 +6844,98 @@ async fn handle_gettext(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    let max_chars = optional_usize(cmd, "maxChars")?;
+    let offset = optional_usize(cmd, "offset")?.unwrap_or(0);
+    let links = cmd.get("links").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let url = mgr.get_url().await.unwrap_or_default();
     let text = super::element::get_element_text(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
+        links,
     )
-    .await?;
-    let url = mgr.get_url().await.unwrap_or_default();
-    Ok(json!({ "text": text, "origin": url }))
+    .await
+    .map_err(|e| gettext_not_found_hint(e, selector, &url))?;
+    let window = text_window(&text, offset, max_chars)?;
+    let mut response = json!({
+        "text": window.text,
+        "origin": url,
+        "totalChars": window.total_chars,
+        "offset": offset,
+        "truncated": window.next_offset.is_some(),
+    });
+    if let Some(next) = window.next_offset {
+        response["nextOffset"] = json!(next);
+    }
+    Ok(response)
+}
+
+fn optional_usize(cmd: &Value, key: &str) -> Result<Option<usize>, String> {
+    match cmd.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(|n| Some(n as usize))
+            .ok_or_else(|| format!("'{}' must be a non-negative integer", key)),
+    }
+}
+
+fn gettext_not_found_hint(error: String, selector: &str, url: &str) -> String {
+    if !error.starts_with("Element not found") {
+        return error;
+    }
+    let scope = if error.contains("selected frame") {
+        " in the selected frame"
+    } else {
+        ""
+    };
+    format!(
+        "get text: no element matches '{}'{} on {}. Check the selector with `get count <selector>`, find content with `snapshot`, or use `get text body` for the whole page.",
+        selector, scope, url
+    )
+}
+
+struct TextWindow {
+    text: String,
+    total_chars: usize,
+    next_offset: Option<usize>,
+}
+
+/// Slices `text` to `[offset, offset + max_chars)` in characters. When content
+/// remains past the window, appends a marker naming the omitted count and the
+/// exact flags that fetch the rest.
+fn text_window(text: &str, offset: usize, max_chars: Option<usize>) -> Result<TextWindow, String> {
+    let total_chars = text.chars().count();
+    if offset > 0 && offset >= total_chars {
+        return Err(format!(
+            "get text: --offset {} is past the end of the text ({} chars)",
+            offset, total_chars
+        ));
+    }
+    let end = match max_chars {
+        Some(max) => total_chars.min(offset.saturating_add(max)),
+        None => total_chars,
+    };
+    let mut window: String = text.chars().skip(offset).take(end - offset).collect();
+    let next_offset = (end < total_chars).then_some(end);
+    if let Some(next) = next_offset {
+        window.push_str(&format!(
+            "\n\n[truncated: showing chars {}-{} of {}; {} more chars omitted. Run again with --offset {} for the next part, or --max-chars 0 for all of it]",
+            offset,
+            end,
+            total_chars,
+            total_chars - end,
+            next
+        ));
+    }
+    Ok(TextWindow {
+        text: window,
+        total_chars,
+        next_offset,
+    })
 }
 
 async fn handle_getattribute(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -10249,6 +10331,7 @@ async fn execute_subaction(
                 &state.ref_map,
                 selector,
                 &state.iframe_sessions,
+                false,
             )
             .await?;
             Ok(json!({ "text": text }))
@@ -13876,6 +13959,56 @@ fn attach_tab_gone_data(resp: &mut Value, state: &DaemonState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn text_window_without_cap_returns_everything() {
+        let w = super::text_window("héllo world", 0, None).unwrap();
+        assert_eq!(w.text, "héllo world");
+        assert_eq!(w.total_chars, 11);
+        assert_eq!(w.next_offset, None);
+    }
+
+    #[test]
+    fn text_window_truncates_by_chars_with_marker() {
+        let w = super::text_window("héllo world", 0, Some(5)).unwrap();
+        assert!(w.text.starts_with("héllo\n\n[truncated: showing chars 0-5 of 11; 6 more chars omitted. Run again with --offset 5"));
+        assert!(w.text.contains("--max-chars 0"));
+        assert_eq!(w.next_offset, Some(5));
+    }
+
+    #[test]
+    fn text_window_pages_with_offset() {
+        let w = super::text_window("héllo world", 5, Some(3)).unwrap();
+        assert!(w
+            .text
+            .starts_with(" wo\n\n[truncated: showing chars 5-8 of 11"));
+        assert_eq!(w.next_offset, Some(8));
+        let last = super::text_window("héllo world", 8, Some(3)).unwrap();
+        assert_eq!(last.text, "rld");
+        assert_eq!(last.next_offset, None);
+    }
+
+    #[test]
+    fn text_window_rejects_offset_past_end() {
+        let err = super::text_window("abc", 3, Some(10)).err().unwrap();
+        assert!(err.contains("--offset 3 is past the end"), "{err}");
+        assert_eq!(super::text_window("", 0, Some(10)).unwrap().text, "");
+    }
+
+    #[test]
+    fn gettext_not_found_error_names_selector_and_page() {
+        let msg = super::gettext_not_found_hint(
+            "Element not found: article".to_string(),
+            "article",
+            "https://news.ycombinator.com/item?id=1",
+        );
+        assert!(
+            msg.contains("no element matches 'article' on https://news.ycombinator.com/item?id=1")
+        );
+        assert!(msg.contains("get text body"));
+        let other = super::gettext_not_found_hint("Unknown ref: e9".to_string(), "@e9", "u");
+        assert_eq!(other, "Unknown ref: e9");
+    }
+
     #[tokio::test]
     async fn test_auth_login_releases_remote_objects_after_failures() {
         use futures_util::{SinkExt, StreamExt};

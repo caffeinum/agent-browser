@@ -2353,7 +2353,7 @@ Usage: agent-browser get <subcommand> [args]
 Retrieves various types of information from elements or the page.
 
 Subcommands:
-  text <selector>            Get text content of element
+  text <selector> [options]  Get text content of element
   html <selector>            Get inner HTML of element
   value <selector>           Get value of input element
   attr <selector> <name>     Get attribute value
@@ -2364,12 +2364,26 @@ Subcommands:
   styles <selector>          Get computed styles of elements
   cdp-url                    Get Chrome DevTools Protocol WebSocket URL
 
+Text Options:
+  --max-chars <n>            Return at most N chars (default: 50000, 0 = no cap).
+                             When cut, the text ends with a [truncated: ...] marker
+                             naming the omitted count and the --offset for the rest
+  --offset <n>               Start at char N (page through long text)
+  --links                    Render visible links inline as [text](href)
+
+  `get text` fails with an error when the selector matches no element; it never
+  falls back to another element.
+
 Global Options:
-  --json               Output as JSON
+  --json               Output as JSON (text adds totalChars, offset, truncated, nextOffset)
   --session <name>     Use specific session
 
 Examples:
   agent-browser get text @e1
+  agent-browser get text body --max-chars 8000
+  agent-browser get text body --max-chars 8000 --offset 8000
+  agent-browser get text main --links
+  agent-browser get text body --max-chars 0 > page.txt
   agent-browser get html "#content"
   agent-browser get value "#email-input"
   agent-browser get attr "#link" href
