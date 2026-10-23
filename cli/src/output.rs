@@ -1806,8 +1806,10 @@ agent-browser type - Type text into an element
 
 Usage: agent-browser type <selector> <text>
 
-Types text into the specified element character by character.
-Unlike fill, this does not clear existing content first. For long text use fill.
+Types text into the specified element as real key presses, one per
+character, so key listeners (autocomplete, shortcuts) see every key.
+Unlike fill, this does not clear existing content first. Key presses are
+slow for long text: for long text use fill.
 
 Global Options:
   --json               Output as JSON

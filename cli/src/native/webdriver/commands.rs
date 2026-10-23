@@ -59,22 +59,21 @@ pub async fn execute(
                 .and_then(Value::as_u64)
                 .filter(|d| *d > 0)
                 .map(std::time::Duration::from_millis);
-            wb.type_text(&el, text, delay).await?;
+            wb.type_keys(Some(&el), text, delay).await?;
             Ok(json!({ "typed": text }))
         }
         "keyboard" => {
-            // Into whatever has focus, like Chrome's keyboard type/inserttext.
-            // Both use Element Send Keys: webkit-cli 0.7.0 inserts long plain
-            // runs as one trusted insertText already.
+            // Into whatever has focus, like Chrome's keyboard type/inserttext:
+            // type presses each key, inserttext inserts the text in one step.
             let text = required(cmd, "text")?;
-            let el = wb.focused_element().await?;
             match cmd.get("subaction").and_then(Value::as_str) {
                 Some("type") => {
-                    wb.type_text(&el, text, None).await?;
+                    wb.type_keys(None, text, None).await?;
                     Ok(json!({ "typed": text }))
                 }
                 Some("insertText") => {
-                    wb.type_text(&el, text, None).await?;
+                    let el = wb.focused_element().await?;
+                    wb.insert_value(&el, text).await?;
                     Ok(json!({ "inserted": text }))
                 }
                 other => Err(format!(

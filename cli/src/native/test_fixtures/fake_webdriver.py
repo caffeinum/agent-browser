@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 args = sys.argv[1:]
 if args[:1] == ["--version"]:
-    print(os.environ.get("FAKE_WD_VERSION", "webkit-cli 0.7.0"))
+    print(os.environ.get("FAKE_WD_VERSION", "webkit-cli 0.7.1"))
     sys.exit(0)
 if args[:1] == ["stop"]:
     # `webkit-cli stop --account NAME`
@@ -192,6 +192,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/session/%s/element" % sid:
             return self.reply(ELEMENT)
         if self.path == "/session/%s/timeouts" % sid:
+            wd_log("timeouts %s" % json.dumps(data, sort_keys=True))
             state["page_load_ms"] = data.get("pageLoad", state.get("page_load_ms"))
             return self.reply(None)
         if self.path == "/session/%s/execute/sync" % sid:
@@ -212,9 +213,24 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(None)
         if self.path == "/session/%s/actions" % sid:
             state.setdefault("actions", []).append(data)
+            # Key presses type into the (single) field, like a focused input.
+            for source in data.get("actions", []):
+                if source.get("type") != "key":
+                    continue
+                for step in source.get("actions", []):
+                    key = step.get("value", "")
+                    if step.get("type") == "keyDown" and not ("" <= key <= ""):
+                        state["typed"] = state.get("typed", "") + key
             if os.environ.get("FAKE_WD_LOG"):
                 with open(os.environ["FAKE_WD_LOG"], "a") as log:
                     log.write("actions %s\n" % json.dumps(data, sort_keys=True))
+            if "slowtype.test" in state["url"]:
+                # webkit-cli 0.7.1 at the session script timeout: it stops,
+                # drops the keys it has not sent and answers `timeout`.
+                return self.reply(
+                    {"error": "timeout", "message": "input stopped: the request timed out or its client hung up"},
+                    500,
+                )
             return self.reply(None)
         if self.path == "/session/%s/element/el-7/click" % sid and "covered.test" in state["url"]:
             # webkit-cli 0.6.0: another element is on top of the target's center.

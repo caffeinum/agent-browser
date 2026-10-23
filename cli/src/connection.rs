@@ -1221,7 +1221,7 @@ pub(crate) fn read_timeout_for(cmd: &Value) -> Duration {
             let chars = text.chars().count() as u64;
             let delay = cmd.get("delay").and_then(Value::as_u64).unwrap_or(0);
             op_ms = op_ms.max(
-                crate::native::webdriver::typing_budget_ms(chars as usize)
+                crate::native::webdriver::typing_request_ms(chars as usize)
                     .saturating_add(delay.saturating_mul(chars)),
             );
         }
@@ -1475,15 +1475,15 @@ mod tests {
 
     #[test]
     fn long_typing_gets_the_typing_budget() {
-        // 65s + 20ms x 2000 = 105s, plus the 10s margin.
+        // 20s + 20ms x 2000 = 60s budget, +2s request margin, +10s read margin.
         let text = "x".repeat(2000);
         assert_eq!(
             read_timeout_for(&json!({"action": "type", "text": text})),
-            Duration::from_secs(115)
+            Duration::from_secs(72)
         );
         assert_eq!(
             read_timeout_for(&json!({"action": "fill", "value": "hi"})),
-            Duration::from_millis(75_040)
+            Duration::from_millis(32_040)
         );
     }
 
