@@ -377,7 +377,8 @@ pub const WEBDRIVER_SUPPORTED_ACTIONS: &[(&str, &str)] = &[
     ("gettext", "get text"),
     ("url", "get url"),
     ("title", "get title"),
-    ("content", "get html"),
+    // Internal (read without a URL); no CLI command of its own.
+    ("content", ""),
     ("evaluate", "eval"),
     ("screenshot", "screenshot"),
     ("cookies_get", "cookies"),
@@ -400,6 +401,7 @@ pub fn unsupported_on_webdriver(action: &str, provider: &str) -> Option<String> 
     let commands: Vec<&str> = WEBDRIVER_SUPPORTED_ACTIONS
         .iter()
         .map(|(_, c)| *c)
+        .filter(|c| !c.is_empty())
         .collect();
     Some(format!(
         "{} is not supported on -p {} (WebDriver); supported: {}; workaround: eval",
