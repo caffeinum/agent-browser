@@ -299,6 +299,36 @@ impl WebDriverClient {
         Ok(())
     }
 
+    /// Perform Actions bounded by `limit` instead of the command limit.
+    pub async fn execute_actions_within(
+        &self,
+        actions: &Value,
+        limit: Duration,
+    ) -> Result<(), String> {
+        let sid = self.session_id()?.to_string();
+        http_request(
+            "POST",
+            &format!("{}/session/{}/actions", self.base_url, sid),
+            Some(actions),
+            Some(limit),
+        )
+        .await?
+        .into_value()?;
+        Ok(())
+    }
+
+    /// Set only the session's script timeout (W3C /timeouts). webkit-cli
+    /// 0.7.1 also stops input (Element Send Keys, Perform Actions) at it.
+    pub async fn set_script_timeout(&self, script: Duration) -> Result<(), String> {
+        let sid = self.session_id()?.to_string();
+        self.post(
+            &format!("/session/{}/timeouts", sid),
+            &json!({ "script": script.as_millis() as u64 }),
+        )
+        .await?;
+        Ok(())
+    }
+
     fn session_id(&self) -> Result<&str, String> {
         self.session_id
             .as_deref()

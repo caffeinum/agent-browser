@@ -13,7 +13,7 @@ pub const WEBKIT_CLI_ENV: &str = "AGENT_BROWSER_WEBKIT_CLI";
 pub const WEBKIT_ACCOUNT_ENV: &str = "AGENT_BROWSER_WEBKIT_ACCOUNT";
 const BINARY_NAME: &str = "webkit-cli";
 const INSTALL_HINT: &str =
-    "Install webkit-cli 0.7.0 or later (https://github.com/caffeinum/webkit-cli)";
+    "Install webkit-cli 0.7.1 or later (https://github.com/caffeinum/webkit-cli)";
 
 /// Resolve the webkit-cli binary: `--executable-path`, then
 /// `AGENT_BROWSER_WEBKIT_CLI`, then `webkit-cli` on PATH.
@@ -80,10 +80,12 @@ pub fn webdriver_args(account: &str, port: u16) -> Vec<String> {
 /// Oldest webkit-cli with what the provider relies on: honored
 /// pageLoadStrategy, session timeouts, and commands that keep working after
 /// a navigation times out (0.5.0), trusted input from the OS event path with
-/// element handles kept out of the DOM (0.6.0), and Element Send Keys that
-/// inserts runs of 64+ plain characters as one trusted insertText and drops
-/// unsent keys when its input deadline passes (0.7.0).
-pub const MIN_VERSION: (u64, u64, u64) = (0, 7, 0);
+/// element handles kept out of the DOM (0.6.0), Element Send Keys that
+/// inserts runs of 64+ plain characters as one trusted insertText (0.7.0),
+/// and input (Send Keys, Perform Actions) that stops, dropping the keys not
+/// yet sent, at the session script timeout or when the client hangs up
+/// (0.7.1).
+pub const MIN_VERSION: (u64, u64, u64) = (0, 7, 1);
 
 /// Parse `webkit-cli 0.5.0` (or a bare `0.5.0`).
 pub fn parse_version(output: &str) -> Option<(u64, u64, u64)> {
@@ -202,13 +204,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join(BINARY_NAME);
-        std::fs::write(&bin, "#!/bin/sh\necho 'webkit-cli 0.6.0'\n").unwrap();
+        std::fs::write(&bin, "#!/bin/sh\necho 'webkit-cli 0.7.0'\n").unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let err = require_supported_version(&bin).await.unwrap_err();
-        assert!(err.contains("webkit-cli 0.6.0"), "{}", err);
-        assert!(err.contains("needs 0.7.0 or later"), "{}", err);
+        assert!(err.contains("webkit-cli 0.7.0"), "{}", err);
+        assert!(err.contains("needs 0.7.1 or later"), "{}", err);
 
-        std::fs::write(&bin, "#!/bin/sh\necho 'webkit-cli 0.7.0'\n").unwrap();
+        std::fs::write(&bin, "#!/bin/sh\necho 'webkit-cli 0.7.1'\n").unwrap();
         require_supported_version(&bin).await.unwrap();
     }
 
@@ -274,7 +276,7 @@ mod tests {
             "got: {}",
             err
         );
-        assert!(err.contains("0.7.0"), "got: {}", err);
+        assert!(err.contains("0.7.1"), "got: {}", err);
     }
 
     #[cfg(unix)]

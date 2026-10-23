@@ -56,6 +56,10 @@ pub struct WebDriverBackend {
     /// The session uses pageLoadStrategy "none" and agent-browser waits for
     /// page readiness itself (see readiness.rs).
     own_page_load: bool,
+    /// The driver stops input at the session script timeout (webkit-cli
+    /// 0.7.1), so each typing call sets it to that call's budget and then
+    /// restores the session's own (which equals its page-load timeout).
+    input_stops_at_script_timeout: bool,
 }
 
 /// A driver-enforced page-load timeout strictly below a client backstop, so
@@ -74,6 +78,58 @@ pub struct Load {
 
 /// How long a command waits to learn whether a busy driver is free again.
 const BUSY_PROBE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How much longer than a typing budget agent-browser waits for the answer.
+const TYPING_MARGIN: std::time::Duration =
+    std::time::Duration::from_millis(super::TYPING_MARGIN_MS);
+
+/// The budget for entering `chars` characters, plus any per-key delay.
+fn budget_for(chars: usize, delay: Option<std::time::Duration>) -> std::time::Duration {
+    let delay_ms = delay.map_or(0, |d| d.as_millis() as u64);
+    std::time::Duration::from_millis(
+        super::typing_budget_ms(chars).saturating_add(delay_ms.saturating_mul(chars as u64)),
+    )
+}
+
+fn remaining(deadline: std::time::Instant) -> std::time::Duration {
+    deadline.saturating_duration_since(std::time::Instant::now())
+}
+
+/// W3C key actions pressing and releasing each character in turn. A newline
+/// is Enter and a tab is Tab; a carriage return is dropped.
+fn key_actions(chars: &[char]) -> Value {
+    let steps: Vec<Value> = chars
+        .iter()
+        .filter(|c| **c != '\r')
+        .flat_map(|c| {
+            let key = match c {
+                '\n' => '\u{E007}',
+                '\t' => '\u{E004}',
+                other => *other,
+            }
+            .to_string();
+            [
+                serde_json::json!({ "type": "keyDown", "value": key }),
+                serde_json::json!({ "type": "keyUp", "value": key }),
+            ]
+        })
+        .collect();
+    serde_json::json!({ "actions": [{ "type": "key", "id": "keyboard", "actions": steps }] })
+}
+
+/// Focus an element and put the caret at the end of its text, as Element
+/// Send Keys does, so `type` appends.
+const FOCUS_AT_END_JS: &str = "var el = arguments[0];
+el.focus();
+try {
+  if (typeof el.selectionStart === 'number') {
+    var n = el.value.length; el.setSelectionRange(n, n);
+  } else if (el.isContentEditable) {
+    var r = document.createRange(); r.selectNodeContents(el); r.collapse(false);
+    var s = getSelection(); s.removeAllRanges(); s.addRange(r);
+  }
+} catch (e) {}
+return null;";
 
 /// Describe a click target and the element on top of its center
 /// (`{ target, cover }`; `cover` is null when nothing else is there).
@@ -100,7 +156,14 @@ impl WebDriverBackend {
             busy: std::sync::Mutex::new(None),
             page_load_timeout: std::sync::Mutex::new(None),
             own_page_load: false,
+            input_stops_at_script_timeout: false,
         }
+    }
+
+    /// The driver stops input at the session script timeout (see the field).
+    pub fn with_input_deadline(mut self) -> Self {
+        self.input_stops_at_script_timeout = true;
+        self
     }
 
     fn set_busy(&self, message: String) {
@@ -403,80 +466,142 @@ impl WebDriverBackend {
         })
     }
 
-    /// Clear the field and send `value` with Element Send Keys.
+    /// Clear the field and insert `value` in one step (`insert_value`).
     pub async fn fill_element(&self, element_id: &str, value: &str) -> Result<(), String> {
         self.ensure_idle().await?;
         self.client.clear_element(element_id).await?;
-        self.type_text(element_id, value, None).await
+        self.insert_value(element_id, value).await
     }
 
-    /// Send `text` with Element Send Keys in one call at every length:
-    /// webkit-cli 0.7.0 inserts each run of 64+ plain characters as one
-    /// trusted insertText and types shorter runs key by key. The call may
-    /// take [`super::typing_budget_ms`]. With a `delay`, keys go one call at
-    /// a time and nothing more is sent once that budget is spent.
-    pub async fn type_text(
+    /// Element Send Keys with `text`, without clearing (fill, keyboard
+    /// inserttext). webkit-cli inserts each run of 64+ plain characters as
+    /// one trusted insertText, so long text takes a fraction of a second.
+    pub async fn insert_value(&self, element_id: &str, text: &str) -> Result<(), String> {
+        self.ensure_idle().await?;
+        let budget = budget_for(text.chars().count(), None);
+        self.within_input_budget(budget, |deadline| async move {
+            self.client
+                .send_keys_within(element_id, text, remaining(deadline))
+                .await
+                .map_err(|e| self.input_error(e, budget, None))
+        })
+        .await
+    }
+
+    /// Type `text` as real key presses: one keyDown/keyUp per character
+    /// through Perform Actions (trusted, as a person types), so per-key
+    /// listeners such as autocomplete see every key. With `element_id` the
+    /// element is focused first with the caret at the end; without it the
+    /// keys go to whatever has focus. Slow for long text (about 2ms a key on
+    /// webkit-cli 0.7.1); fill inserts in one step.
+    pub async fn type_keys(
         &self,
-        element_id: &str,
+        element_id: Option<&str>,
         text: &str,
         delay: Option<std::time::Duration>,
     ) -> Result<(), String> {
         self.ensure_idle().await?;
+        if let Some(el) = element_id {
+            self.execute_function_body(FOCUS_AT_END_JS, vec![super::dom_refs::element_arg(el)])
+                .await?;
+        }
         let chars: Vec<char> = text.chars().collect();
         let total = chars.len();
-        let budget = std::time::Duration::from_millis(
-            super::typing_budget_ms(total)
-                .saturating_add(delay.map_or(0, |d| d.as_millis() as u64 * total as u64)),
-        );
-        let Some(delay) = delay else {
-            return self.send_keys_for_typing(element_id, text, budget).await;
-        };
-        let deadline = std::time::Instant::now() + budget;
-        for (sent, ch) in chars.iter().enumerate() {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return Err(format!(
-                    "Typing stopped after {} of {} characters: it did not finish within {}s. Nothing more is sent; check the field's value before typing the rest",
-                    sent,
-                    total,
-                    budget.as_secs_f32()
-                ));
+        let budget = budget_for(total, delay);
+        self.within_input_budget(budget, |deadline| async move {
+            let Some(delay) = delay else {
+                return self
+                    .client
+                    .execute_actions_within(&key_actions(&chars), remaining(deadline))
+                    .await
+                    .map_err(|e| self.input_error(e, budget, None));
+            };
+            for (sent, ch) in chars.iter().enumerate() {
+                if std::time::Instant::now() + TYPING_MARGIN >= deadline {
+                    return Err(format!(
+                        "Typing stopped after {} of {} characters: it did not finish within {}s. Nothing more is sent; check the field's value before typing the rest",
+                        sent,
+                        total,
+                        budget.as_secs_f32()
+                    ));
+                }
+                self.client
+                    .execute_actions_within(&key_actions(&[*ch]), remaining(deadline))
+                    .await
+                    .map_err(|e| self.input_error(e, budget, Some((sent, total))))?;
+                tokio::time::sleep(delay).await;
             }
-            self.send_keys_for_typing(element_id, &ch.to_string(), deadline - now)
-                .await?;
-            tokio::time::sleep(delay).await;
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
-    async fn send_keys_for_typing(
+    /// Run one input call within `budget`: the driver's session script
+    /// timeout is set to it for the call (webkit-cli 0.7.1 stops input
+    /// there), and agent-browser waits [`TYPING_MARGIN`] longer so the driver
+    /// answers first. A request agent-browser abandons also stops input on
+    /// 0.7.1 (it hangs up).
+    async fn within_input_budget<F, Fut>(
         &self,
-        element_id: &str,
-        text: &str,
-        limit: std::time::Duration,
-    ) -> Result<(), String> {
-        match self.client.send_keys_within(element_id, text, limit).await {
-            Ok(()) => Ok(()),
-            // webkit-cli 0.7.0 stops at its input deadline and drops the keys
-            // it has not sent, then answers `timeout`; it stays usable.
-            Err(e) if e.starts_with("WebDriver timeout ") => Err(format!(
-                "Typing did not finish: {} stopped at its input deadline and dropped the keys it had not sent, so nothing more is typed. Check the field's value before typing the rest",
-                self.label
-            )),
-            // No answer within the budget: the driver may still be typing.
-            Err(e) if e.contains(super::client::NO_ANSWER) => {
-                self.set_busy(format!(
-                    "{} is busy typing text a previous command sent. Retry in a few seconds",
-                    self.label
-                ));
-                Err(format!(
-                    "Typing did not finish within {}s and {} may still be typing it; later commands say it is busy until it is done",
-                    limit.as_secs_f32(),
-                    self.label
-                ))
-            }
-            Err(e) => Err(e),
+        budget: std::time::Duration,
+        call: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(std::time::Instant) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        let restore = if self.input_stops_at_script_timeout {
+            self.current_page_load_timeout()
+        } else {
+            None
+        };
+        if restore.is_some() {
+            self.client.set_script_timeout(budget).await?;
         }
+        let result = call(std::time::Instant::now() + budget + TYPING_MARGIN).await;
+        if let Some(script) = restore {
+            let idle = self.busy.lock().map(|b| b.is_none()).unwrap_or(true);
+            if idle {
+                let _ = self.client.set_script_timeout(script).await;
+            }
+        }
+        result
+    }
+
+    fn input_error(
+        &self,
+        error: String,
+        budget: std::time::Duration,
+        progress: Option<(usize, usize)>,
+    ) -> String {
+        let typed = match progress {
+            Some((sent, total)) => format!(" after {} of {} characters", sent, total),
+            None => String::new(),
+        };
+        // The driver stopped sending keys at its deadline; it stays usable.
+        // Keys it already posted to the page (one batch, at most 16 on
+        // webkit-cli 0.7.1) can still arrive after it answers.
+        if error.starts_with("WebDriver timeout ") {
+            return format!(
+                "Typing stopped{}: it did not finish within {}s, and {} stopped sending keys; up to one batch (16 keys or fewer) already sent may still arrive. Wait a moment and check the field's value before typing the rest; for long text use fill",
+                typed,
+                budget.as_secs_f32(),
+                self.label
+            );
+        }
+        // No answer at all: the driver may still be working on it.
+        if error.contains(super::client::NO_ANSWER) {
+            self.set_busy(format!(
+                "{} is busy typing text a previous command sent. Retry in a few seconds",
+                self.label
+            ));
+            return format!(
+                "Typing did not finish within {}s and {} did not answer; later commands say it is busy until it does",
+                (budget + TYPING_MARGIN).as_secs_f32(),
+                self.label
+            );
+        }
+        error
     }
 
     /// The focused element (`document.activeElement`), for keyboard input.
