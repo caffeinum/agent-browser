@@ -518,9 +518,10 @@ Engine setup and limits: [Lightpanda](https://agent-browser.dev/engines/lightpan
 
 `agent-browser -p webkit --webkit-account <name> <command>` drives macOS system WebKit through webkit-cli 0.5.0+ (`webkit-cli create <name>` first). It keeps one webkit-cli per account across commands; `close` stops it.
 
-- Works: open, back, forward, reload, snapshot, click, fill, get text, get url, get title, eval, screenshot, cookies, close. `snapshot -i` output and `@eN` refs use the same format as Chrome.
-- Not supported (refused with an error naming the command; use `eval` instead): type, press, select, check, uncheck, scroll, wait, hover, focus, dblclick, get value/attr/html/count, is visible/enabled/checked, tabs, set viewport, upload, pdf, find, keyboard, network, console, errors, trace, and other CDP tools.
-- A slow page fails with `Navigation to <url> did not finish within <n>s`; the session stays usable.
+- Works: open, back, forward, reload, snapshot, click, fill, type, press, select, check, uncheck, scroll, scrollintoview, focus, wait (ms, selector, --text, --url, --fn, --load load|domcontentloaded), get text, get url, get title, get attr, get html, get value, get count, is visible, is enabled, is checked, eval, screenshot, cookies, read, close. `snapshot -i` output and `@eN` refs use the same format as Chrome.
+- Refused: hover, dblclick, press with modifiers (webkit-cli does not deliver them yet; use eval), and tabs, set viewport, upload, pdf, find, keyboard type, mouse, network, console, errors, trace (no workaround on WebDriver, or eval where it says so).
+- Clicks return at once; the next command waits for the page the click opened. A page that does not load in time fails with `Navigation to <url> did not ... within <n>s`.
+- Input events are synthesized by webkit-cli (`isTrusted` is false).
 - Rejected options: --proxy, --headers, --user-agent, --state, --extension, --init-script, --enable, --download-path, --args, --color-scheme, --profile, --ca-cert, --allowed-domains.
 
 ## When to load another skill

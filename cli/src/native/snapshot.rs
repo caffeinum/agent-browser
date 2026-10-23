@@ -1517,7 +1517,7 @@ fn dom_script(opts: Value) -> String {
 
 /// Window property holding the page-side element registry. Random per daemon
 /// process, so a page cannot pre-plant or anticipate it.
-fn dom_registry_key() -> &'static str {
+pub(crate) fn dom_registry_key() -> &'static str {
     static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     KEY.get_or_init(|| format!("__ab_{}", uuid::Uuid::new_v4().simple()))
 }

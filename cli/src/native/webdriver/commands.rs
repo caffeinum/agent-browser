@@ -21,6 +21,7 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("wait", "wait"),
     ("waitforurl", ""),
     ("waitforloadstate", ""),
+    ("waitforfunction", ""),
     ("getattribute", "get attr"),
     ("innerhtml", "get html"),
     ("innertext", ""),
@@ -157,6 +158,29 @@ pub async fn execute(
             let pattern = required(cmd, "url")?;
             poll_url(wb, pattern, timeout_ms, url_matches).await?;
             Ok(json!({ "url": wb.get_url_now().await? }))
+        }
+        "waitforfunction" => {
+            let expression = required(cmd, "expression")?;
+            let single = expression.trim().trim_end_matches(';');
+            let body = format!("return (\n{}\n);", single);
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+            loop {
+                let value = page_call(wb, &body, vec![]).await?;
+                let truthy = !matches!(value, Value::Null | Value::Bool(false))
+                    && value != json!(0)
+                    && value != json!("");
+                if truthy {
+                    return Ok(json!({ "result": value }));
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "Wait gave up after {}ms: {} never returned a truthy value",
+                        timeout_ms, expression
+                    ));
+                }
+                tokio::time::sleep(POLL).await;
+            }
         }
         "waitforloadstate" => {
             let load_state = cmd.get("state").and_then(Value::as_str).unwrap_or("load");

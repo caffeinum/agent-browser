@@ -51,6 +51,9 @@ pub struct WebDriverBackend {
     /// The session's W3C page-load timeout when the driver enforces one
     /// (webkit-cli). It always sits below the client's backstop.
     page_load_timeout: std::sync::Mutex<Option<std::time::Duration>>,
+    /// The session uses pageLoadStrategy "none" and agent-browser waits for
+    /// page readiness itself (see readiness.rs).
+    own_page_load: bool,
 }
 
 /// A driver-enforced page-load timeout strictly below a client backstop, so
@@ -77,7 +80,24 @@ impl WebDriverBackend {
             label: "WebDriver server".to_string(),
             busy_loading: std::sync::Mutex::new(None),
             page_load_timeout: std::sync::Mutex::new(None),
+            own_page_load: false,
         }
+    }
+
+    /// The driver returns before pages load; agent-browser waits itself.
+    pub fn with_own_page_load(mut self) -> Self {
+        self.own_page_load = true;
+        self
+    }
+
+    pub fn manages_page_load(&self) -> bool {
+        self.own_page_load
+    }
+
+    /// How long agent-browser itself waits for a page, below `backstop`.
+    fn own_wait(&self, backstop: std::time::Duration) -> std::time::Duration {
+        self.current_page_load_timeout()
+            .unwrap_or_else(|| page_load_timeout_below(backstop))
     }
 
     /// Record the page-load timeout the session was created with.
@@ -178,8 +198,46 @@ impl WebDriverBackend {
             phrase: format!("navigation to {}", url),
             what: url.to_string(),
         };
+        if self.own_page_load {
+            let phrase = load.phrase.clone();
+            return self
+                .loading(
+                    load,
+                    limit,
+                    self.navigate_and_wait(
+                        &phrase,
+                        super::readiness::Arrival::Url(url),
+                        self.own_wait(limit),
+                        self.client.navigate_within(url, limit),
+                    ),
+                )
+                .await;
+        }
         self.loading(load, limit, self.client.navigate_within(url, limit))
             .await
+    }
+
+    async fn history_step<F>(
+        &self,
+        load: Load,
+        arrival: super::readiness::Arrival<'_>,
+        call: F,
+    ) -> Result<(), String>
+    where
+        F: std::future::Future<Output = Result<(), String>>,
+    {
+        let backstop = self.page_load_backstop();
+        if self.own_page_load {
+            let phrase = load.phrase.clone();
+            return self
+                .loading(
+                    load,
+                    backstop,
+                    self.navigate_and_wait(&phrase, arrival, self.own_wait(backstop), call),
+                )
+                .await;
+        }
+        self.loading(load, backstop, call).await
     }
 
     fn page_load_backstop(&self) -> std::time::Duration {
@@ -347,7 +405,7 @@ impl BrowserBackend for WebDriverBackend {
             phrase: "navigation back".to_string(),
             what: "the previous page".to_string(),
         };
-        self.loading(load, self.page_load_backstop(), self.client.back())
+        self.history_step(load, super::readiness::Arrival::History, self.client.back())
             .await
     }
 
@@ -356,8 +414,12 @@ impl BrowserBackend for WebDriverBackend {
             phrase: "navigation forward".to_string(),
             what: "the next page".to_string(),
         };
-        self.loading(load, self.page_load_backstop(), self.client.forward())
-            .await
+        self.history_step(
+            load,
+            super::readiness::Arrival::History,
+            self.client.forward(),
+        )
+        .await
     }
 
     async fn reload(&self) -> Result<(), String> {
@@ -365,8 +427,12 @@ impl BrowserBackend for WebDriverBackend {
             phrase: "reload".to_string(),
             what: "the reloaded page".to_string(),
         };
-        self.loading(load, self.page_load_backstop(), self.client.refresh())
-            .await
+        self.history_step(
+            load,
+            super::readiness::Arrival::Reload,
+            self.client.refresh(),
+        )
+        .await
     }
 
     async fn get_cookies(&self) -> Result<Value, String> {

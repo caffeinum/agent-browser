@@ -33,7 +33,15 @@ def flag(name, default=None):
 
 port = int(flag("--port", "0"))
 account = flag("--account")
-state = {"url": "about:blank", "sessions": 0}
+state = {"url": "about:blank", "sessions": 0, "origin": 1.0}
+
+
+def commit_pending_navigation():
+    """A click on a "slowlink" page starts a navigation that commits 1s later."""
+    if state.get("commit_at") and time.time() >= state["commit_at"]:
+        state["url"] = state.pop("pending")
+        state.pop("commit_at")
+        state["origin"] += 1
 
 if os.environ.get("FAKE_WD_LOG"):
     with open(os.environ["FAKE_WD_LOG"], "a") as log:
@@ -60,6 +68,9 @@ SNAPSHOT = {
 
 def execute(script, args=()):
     """Canned answers for agent-browser's DOM-walk scripts (no JS engine here)."""
+    commit_pending_navigation()
+    if "navigation.addEventListener('navigate'" in script:
+        return {"pending": state.get("pending"), "ready": True, "url": state["url"], "origin": state["origin"]}
     if "__abOpts" in script:
         return ELEMENT if '"resolve"' in script else SNAPSHOT
     if "wanted = arguments[1]" in script:
@@ -71,6 +82,8 @@ def execute(script, args=()):
     if "v == null ? '' : String(v)" in script:
         return state.get("typed", "")
     if "innerText" in script:
+        if state["url"].endswith("/arrived"):
+            return "Arrived page"
         return "Save (clicked %d)" % state.get("clicks", 0)
     return None
 
@@ -118,7 +131,10 @@ class Handler(BaseHTTPRequestHandler):
             if "slow.test" in data["url"]:
                 time.sleep(2)
             state["url"] = data["url"]
+            state["origin"] += 1
             return self.reply(None)
+        if self.path == "/session/%s/element" % sid:
+            return self.reply(ELEMENT)
         if self.path == "/session/%s/timeouts" % sid:
             state["page_load_ms"] = data.get("pageLoad", state.get("page_load_ms"))
             return self.reply(None)
@@ -138,8 +154,12 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(3600)
         if self.path == "/session/%s/element/el-7/click" % sid:
             state["clicks"] = state.get("clicks", 0) + 1
+            if "slowlink" in state["url"]:
+                state["pending"] = state["url"].split("/slowlink")[0] + "/arrived"
+                state["commit_at"] = time.time() + 1.0
             return self.reply(None)
         if self.path == "/session/%s/back" % sid:
+            state["origin"] += 1
             return self.reply(None)
         return self.reply({"error": "unknown command", "message": self.path}, 404)
 
@@ -148,6 +168,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/status":
             return self.reply({"ready": True, "message": "fake"})
         if self.path == "/session/%s/url" % sid:
+            commit_pending_navigation()
             return self.reply(state["url"])
         if self.path == "/session/%s/title" % sid:
             return self.reply("Fake %s" % account)

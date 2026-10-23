@@ -3118,6 +3118,18 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             if let Err(busy) = wb.ensure_idle().await {
                 return error_response(&id, &busy);
             }
+            // A click (or key) may have started a navigation that has not
+            // committed yet; never act on or read the old page.
+            if !matches!(action, "navigate" | "back" | "forward" | "reload") {
+                let limit = std::time::Duration::from_millis(state.timeout_ms(cmd))
+                    .min(std::time::Duration::from_millis(state.default_timeout_ms));
+                if let Err(e) = wb
+                    .settle(super::webdriver::backend::page_load_timeout_below(limit))
+                    .await
+                {
+                    return error_response(&id, &e);
+                }
+            }
         }
         if needs_launch {
             lifecycle_relaunched_browser = restore_transition_closed_browser
@@ -5659,8 +5671,9 @@ async fn launch_webkit(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         None => 0,
     };
     // webkit-cli enforces the page-load and script timeouts itself, below the
-    // client backstop, and answers `timeout` while staying usable. "eager"
-    // returns once the DOM is ready instead of waiting for every subresource.
+    // client backstop. With "none", navigations and clicks return once
+    // dispatched and agent-browser waits for readiness itself (readiness.rs),
+    // so a click on a slow link returns like it does on Chrome.
     let page_load = super::webdriver::backend::page_load_timeout_below(
         std::time::Duration::from_millis(state.default_timeout_ms),
     );
@@ -5673,10 +5686,11 @@ async fn launch_webkit(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             identity: format!("{}{}", WEBKIT_IDENTITY_PREFIX, account),
             engine: "webkit",
             capabilities: json!({
-                "pageLoadStrategy": "eager",
+                "pageLoadStrategy": "none",
                 "timeouts": { "pageLoad": page_load_ms, "script": page_load_ms },
             }),
             page_load_timeout: Some(page_load),
+            own_page_load: true,
             stop_command: Some((binary.clone(), webkit::stop_args(&account))),
         },
         || async {
@@ -5703,6 +5717,7 @@ async fn launch_safari(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             capabilities: json!({ "browserName": "safari" }),
             stop_command: None,
             page_load_timeout: None,
+            own_page_load: false,
         },
         || safari::launch_safaridriver(port),
     )
@@ -5730,6 +5745,8 @@ struct LocalWebDriver {
     stop_command: Option<(std::path::PathBuf, Vec<String>)>,
     /// Page-load timeout the driver enforces for this session, if any.
     page_load_timeout: Option<std::time::Duration>,
+    /// The driver returns before pages load and agent-browser waits itself.
+    own_page_load: bool,
 }
 
 /// Launch a locally spawned WebDriver server, or reuse the live session when
@@ -5776,6 +5793,9 @@ where
     let mut backend = WebDriverBackend::new(client).with_label(spec.driver_label);
     if let Some(timeout) = spec.page_load_timeout {
         backend = backend.with_page_load_timeout(timeout);
+    }
+    if spec.own_page_load {
+        backend = backend.with_own_page_load();
     }
     state.webdriver_backend = Some(backend);
     state.webdriver_identity = Some(spec.identity);
@@ -15996,6 +16016,7 @@ mod tests {
             capabilities: json!({}),
             stop_command: None,
             page_load_timeout: None,
+            own_page_load: false,
         }
     }
 
@@ -17207,6 +17228,99 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             "{}",
             back
         );
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    /// Launching a CDP browser replaces a WebDriver session and stops its
+    /// driver (and webkit-cli's account) instead of leaving it running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_switching_to_a_cdp_browser_stops_the_webdriver_driver() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _launch, log) = launch_fake_webkit_with_limit(dir.path(), 2000).await;
+        let pid = state.webdriver_process.as_ref().unwrap().pid().unwrap() as i32;
+        let closed_port = crate::native::webdriver::driver_process::pick_free_port().unwrap();
+
+        let _ = handle_launch(
+            &json!({ "action": "launch", "cdpPort": closed_port }),
+            &mut state,
+        )
+        .await;
+
+        assert!(state.webdriver_backend.is_none());
+        assert!(state.webdriver_process.is_none());
+        assert!(std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("stop ab-test"));
+        assert!(
+            unsafe { libc::kill(pid, 0) } != 0,
+            "webkit-cli must have exited"
+        );
+    }
+
+    /// With pageLoadStrategy "none" a click returns once dispatched; the next
+    /// read waits for the navigation it started to commit, so `get url` and
+    /// `get text` right after the click see the new page.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_reads_after_a_navigating_click_see_the_new_page() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _launch, _log) = launch_fake_webkit_with_limit(dir.path(), 5000).await;
+        let open = execute_command(
+            &json!({ "id": "o", "action": "navigate", "url": "http://site.test/slowlink" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(open["success"], true, "{}", open);
+        let snap = execute_command(
+            &json!({ "id": "s", "action": "snapshot", "interactive": true }),
+            &mut state,
+        )
+        .await;
+        let tree = snap["data"]["snapshot"].as_str().unwrap().to_string();
+        let target = format!(
+            "@{}",
+            tree.split("ref=").nth(1).unwrap().trim_end_matches(']')
+        );
+
+        let started = std::time::Instant::now();
+        let click = execute_command(
+            &json!({ "id": "c", "action": "click", "selector": target }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(click["success"], true, "{}", click);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(800),
+            "click must not wait for the load"
+        );
+
+        let url = execute_command(&json!({ "id": "u", "action": "url" }), &mut state).await;
+        assert_eq!(url["data"]["url"], "http://site.test/arrived", "{}", url);
+        let text = execute_command(
+            &json!({ "id": "t", "action": "gettext", "selector": "body" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(text["data"]["text"], "Arrived page", "{}", text);
         close_all_browser_backends(&mut state).await.unwrap();
     }
 
