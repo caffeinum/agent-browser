@@ -104,6 +104,18 @@ impl DriverProcess {
         }
     }
 
+    /// `Some(message)` once the driver has exited on its own, so commands can
+    /// say why the session is gone instead of failing with a connection error.
+    pub fn exit_report(&mut self) -> Option<String> {
+        let status = self.child.as_mut()?.try_wait().ok()??;
+        Some(format!(
+            "{} WebDriver driver exited ({}); run launch again{}",
+            self.name,
+            status,
+            self.output_suffix()
+        ))
+    }
+
     /// Everything the driver has written to stdout/stderr so far (tail-bounded).
     pub fn output(&self) -> String {
         self.output.lock().map(|o| o.clone()).unwrap_or_default()

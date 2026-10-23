@@ -2937,7 +2937,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         } else if let Some(ref mut mgr) = state.browser {
             mgr.has_process_exited() || !mgr.is_connection_alive().await
         } else {
-            true
+            // A WebDriver provider (Safari, iOS) owns the session without a
+            // CDP browser; auto-launching Chrome would silently replace it.
+            state.webdriver_backend.is_none()
         }
     } else {
         false
@@ -3031,6 +3033,13 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     };
 
     if !skip_launch {
+        if let Some(report) = state
+            .webdriver_process
+            .as_mut()
+            .and_then(|driver| driver.exit_report())
+        {
+            return error_response(&id, &report);
+        }
         if needs_launch {
             lifecycle_relaunched_browser = restore_transition_closed_browser
                 || state.browser.is_some()
@@ -15506,6 +15515,77 @@ mod tests {
             !restarted_path.exists(),
             "failed preflight must not create the replacement output"
         );
+    }
+
+    fn attach_fake_webdriver_session(state: &mut DaemonState, port: u16) {
+        state.backend_type = BackendType::WebDriver;
+        state.webdriver_backend = Some(WebDriverBackend::new(
+            crate::native::webdriver::client::WebDriverClient::new_with_session(
+                port,
+                "test-session".to_string(),
+            ),
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_webdriver_session_is_not_replaced_by_chrome_auto_launch() {
+        let (port, server) = start_webdriver_response_server(vec![(
+            "/session/test-session/url",
+            json!({ "value": "https://example.com/webdriver" }),
+        )])
+        .await;
+        let mut state = DaemonState::new();
+        attach_fake_webdriver_session(&mut state, port);
+
+        let resp = execute_command(&json!({ "id": "u", "action": "url" }), &mut state).await;
+
+        assert_eq!(resp["success"], true, "{}", resp);
+        assert_eq!(resp["data"]["url"], "https://example.com/webdriver");
+        assert!(state.browser.is_none(), "no Chrome may be auto-launched");
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_exited_webdriver_driver_fails_loudly() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let port = crate::native::webdriver::driver_process::pick_free_port().unwrap();
+        let script = format!(
+            "python3 -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((\"127.0.0.1\",{})); s.listen(); time.sleep(0.5); sys.stderr.write(\"driver crashed\\n\"); sys.exit(3)'",
+            port
+        );
+        let driver = crate::native::webdriver::driver_process::DriverProcess::spawn(
+            "fake-driver",
+            std::path::Path::new("/bin/sh"),
+            &["-c".to_string(), script],
+            port,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let mut state = DaemonState::new();
+        attach_fake_webdriver_session(&mut state, port);
+        state.webdriver_process = Some(driver);
+
+        let resp = execute_command(&json!({ "id": "u", "action": "url" }), &mut state).await;
+
+        assert_eq!(resp["success"], false, "{}", resp);
+        let error = resp["error"].as_str().unwrap();
+        assert!(
+            error.contains("fake-driver WebDriver driver exited"),
+            "{}",
+            error
+        );
+        assert!(error.contains("run launch again"), "{}", error);
+        assert!(error.contains("driver crashed"), "{}", error);
+        assert!(state.browser.is_none());
     }
 
     #[tokio::test]
