@@ -422,43 +422,179 @@ const IOS_ONLY_ACTIONS: &[&str] = &["tap", "swipe", "device"];
 /// ("webkit", "safari", "ios"); otherwise the error to return. Actions that
 /// never touch the page (`skip_launch` ones) are not passed here.
 pub fn unsupported_on_webdriver(action: &str, provider: &str) -> Option<String> {
+    if provider == "webkit" {
+        if let Some(reason) = WEBKIT_CLI_INPUT_GAPS
+            .iter()
+            .find(|(a, _)| *a == action)
+            .map(|(_, r)| *r)
+        {
+            return Some(format!(
+                "{} is not supported on -p webkit: {}; workaround: eval",
+                command_name(action),
+                reason
+            ));
+        }
+    }
     let supported = all_supported().any(|(a, _)| a == action)
         || (provider == "ios" && IOS_ONLY_ACTIONS.contains(&action));
     if supported {
         return None;
     }
-    let commands: Vec<&str> = all_supported()
+    let mut commands: Vec<&str> = all_supported()
+        .filter(|(a, _)| provider != "webkit" || !WEBKIT_CLI_INPUT_GAPS.iter().any(|(g, _)| g == a))
         .map(|(_, c)| c)
         .filter(|c| !c.is_empty())
         .collect();
+    commands.push("read");
+    commands.push("close");
+    let workaround = if NO_WORKAROUND.contains(&action) {
+        "no workaround on WebDriver"
+    } else {
+        "workaround: eval"
+    };
     Some(format!(
-        "{} is not supported on -p {} (WebDriver); supported: {}; workaround: eval",
-        cli_command_name(action),
+        "{} is not supported on -p {} (WebDriver); supported: {}; {}",
+        command_name(action),
         provider,
-        commands.join(", ")
+        commands.join(", "),
+        workaround
     ))
 }
 
-/// The CLI spelling of a daemon action, for messages.
-fn cli_command_name(action: &str) -> String {
-    let known = match action {
-        "network" | "requests" | "network_requests" => "network",
-        "har_start" | "har_stop" => "network har",
+/// webkit-cli 0.5.0 synthesizes input in the page (isTrusted=false): a
+/// pointer move sends no mouseover, a double press sends no dblclick, and
+/// held modifiers are not applied. Commands that depend on those are refused
+/// on webkit rather than reporting success the page never saw.
+pub const WEBKIT_CLI_INPUT_GAPS: &[(&str, &str)] = &[
+    (
+        "hover",
+        "webkit-cli does not send mouseover/mouseenter for pointer moves yet",
+    ),
+    (
+        "dblclick",
+        "webkit-cli does not send dblclick events for double presses yet",
+    ),
+];
+
+/// Browser-level features WebDriver has no equivalent for.
+const NO_WORKAROUND: &[&str] = &[
+    "tab_list",
+    "tab_new",
+    "tab_switch",
+    "tab_close",
+    "window_new",
+    "viewport",
+    "set_media",
+    "device",
+    "user_agent",
+    "timezone",
+    "locale",
+    "geolocation",
+    "permissions",
+    "offline",
+    "headers",
+    "upload",
+    "pdf",
+    "download",
+    "waitfordownload",
+    "console",
+    "errors",
+    "requests",
+    "request_detail",
+    "responsebody",
+    "route",
+    "unroute",
+    "har_start",
+    "har_stop",
+    "trace_start",
+    "trace_stop",
+    "profiler_start",
+    "profiler_stop",
+    "screencast_start",
+    "screencast_stop",
+    "recording_start",
+    "recording_stop",
+    "recording_restart",
+    "video_start",
+    "video_stop",
+    "dialog",
+    "addinitscript",
+    "expose",
+    "state_save",
+    "state_load",
+    "clipboard",
+    "bringtofront",
+    "frame",
+    "mainframe",
+    "diff_screenshot",
+    "pause",
+];
+
+/// The command an agent typed for a daemon action, for messages.
+pub fn command_name(action: &str) -> String {
+    let name = match action {
+        "inputvalue" => "get value",
+        "getattribute" => "get attr",
+        "innerhtml" => "get html",
+        "innertext" | "gettext" => "get text",
+        "boundingbox" => "get box",
+        "styles" => "get styles",
+        "count" => "get count",
+        "isvisible" => "is visible",
+        "isenabled" => "is enabled",
+        "ischecked" => "is checked",
+        "waitforloadstate" => "wait --load",
+        "waitforurl" => "wait --url",
+        "waitforfunction" => "wait --fn",
+        "waitfordownload" => "wait --download",
+        "keyboard" => "keyboard type",
+        "inserttext" => "keyboard inserttext",
+        "keydown" => "keydown",
+        "keyup" => "keyup",
+        "getbyrole" | "getbytext" | "getbylabel" | "getbyplaceholder" | "getbyalttext"
+        | "getbytitle" | "getbytestid" | "nth" => "find",
+        "mousemove" | "mousedown" | "mouseup" | "mouse" => "mouse",
+        "wheel" => "mouse wheel",
+        "input_mouse" | "input_keyboard" | "input_touch" => "input",
+        "tab_list" | "tab_new" | "tab_switch" | "tab_close" => "tab",
+        "window_new" => "window new",
+        "viewport" => "set viewport",
+        "set_media" => "set media",
+        "device" => "set device",
+        "user_agent" => "set user-agent",
+        "timezone" => "set timezone",
+        "locale" => "set locale",
+        "geolocation" => "set geo",
+        "permissions" => "set permissions",
+        "offline" => "set offline",
+        "headers" => "set headers",
+        "setcontent" => "set content",
+        "setvalue" => "set value",
+        "cookies_set" => "cookies set",
+        "cookies_clear" => "cookies clear",
+        "storage_get" | "storage_set" | "storage_clear" => "storage",
+        "state_save" => "state save",
+        "state_load" => "state load",
+        "requests" | "request_detail" => "network requests",
+        "responsebody" => "network response",
         "route" | "unroute" => "network route",
+        "har_start" | "har_stop" => "network har",
         "trace_start" | "trace_stop" => "trace",
         "profiler_start" | "profiler_stop" => "profiler",
         "screencast_start" | "screencast_stop" => "screencast",
-        "addscript" | "addinitscript" => "addscript",
-        "tab_new" | "tab_list" | "tab_switch" | "tab_close" => "tab",
-        "setviewport" | "viewport" => "set viewport",
-        "keyboard" | "press" | "keydown" | "keyup" => "press",
-        _ => "",
+        "recording_start" | "recording_stop" | "recording_restart" | "video_start"
+        | "video_stop" => "record",
+        "diff_snapshot" => "diff snapshot",
+        "diff_url" => "diff url",
+        "diff_screenshot" => "diff screenshot",
+        "evaluate" | "evalhandle" => "eval",
+        "multiselect" => "select",
+        "selectall" => "selectall",
+        "mainframe" => "frame main",
+        "navigate" => "open",
+        other => return other.replace('_', " "),
     };
-    if known.is_empty() {
-        action.replace('_', " ")
-    } else {
-        known.to_string()
-    }
+    name.to_string()
 }
 
 #[cfg(test)]
@@ -469,6 +605,7 @@ mod tests {
     fn test_supported_actions_pass_and_others_name_the_alternatives() {
         assert_eq!(unsupported_on_webdriver("navigate", "webkit"), None);
         assert_eq!(unsupported_on_webdriver("gettext", "safari"), None);
+        assert_eq!(unsupported_on_webdriver("inputvalue", "webkit"), None);
         let err = unsupported_on_webdriver("trace_start", "webkit").unwrap();
         assert!(
             err.starts_with(
@@ -477,8 +614,32 @@ mod tests {
             "{}",
             err
         );
+        assert!(err.contains(", read, close;"), "{}", err);
+        assert!(err.ends_with("; no workaround on WebDriver"), "{}", err);
+        let err = unsupported_on_webdriver("getbyrole", "webkit").unwrap();
+        assert!(err.starts_with("find is not supported"), "{}", err);
         assert!(err.ends_with("; workaround: eval"), "{}", err);
+        let err = unsupported_on_webdriver("keyboard", "webkit").unwrap();
+        assert!(err.starts_with("keyboard type is not supported"), "{}", err);
         assert!(unsupported_on_webdriver("tap", "webkit").is_some());
         assert_eq!(unsupported_on_webdriver("tap", "ios"), None);
+    }
+
+    #[test]
+    fn webkit_refuses_input_webkit_cli_cannot_deliver_but_safari_keeps_it() {
+        let err = unsupported_on_webdriver("hover", "webkit").unwrap();
+        assert!(
+            err.contains("webkit-cli does not send mouseover"),
+            "{}",
+            err
+        );
+        assert!(unsupported_on_webdriver("dblclick", "webkit")
+            .unwrap()
+            .contains("dblclick"));
+        assert_eq!(unsupported_on_webdriver("hover", "safari"), None);
+        assert_eq!(unsupported_on_webdriver("dblclick", "safari"), None);
+        assert!(!unsupported_on_webdriver("tab_new", "webkit")
+            .unwrap()
+            .contains("hover"));
     }
 }

@@ -915,7 +915,17 @@ async fn test_webdriver_sessions_refuse_unsupported_commands_by_name() {
         let error = result["error"].as_str().unwrap_or("");
         assert!(
             error.contains("is not supported on -p webkit (WebDriver); supported: open,")
-                && error.ends_with("; workaround: eval"),
+                && (error.ends_with("; workaround: eval")
+                    || error.ends_with("; no workaround on WebDriver"))
+                && ![
+                    "getbyrole",
+                    "waitforloadstate",
+                    "getattribute",
+                    "inputvalue",
+                    "inserttext"
+                ]
+                .iter()
+                .any(|internal| error.starts_with(&format!("{} ", internal))),
             "{}: {}",
             action,
             error

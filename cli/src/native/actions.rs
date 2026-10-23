@@ -3213,6 +3213,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     let result = match action {
         _ if webdriver_page_command => {
             let timeout_ms = state.timeout_ms(cmd);
+            let provider = state.webdriver_provider_name();
             match state.webdriver_backend {
                 Some(ref wb) => {
                     super::webdriver::commands::execute(
@@ -3222,6 +3223,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                         &state.ref_map,
                         timeout_ms,
                         route_url_matches,
+                        &provider,
                     )
                     .await
                 }
