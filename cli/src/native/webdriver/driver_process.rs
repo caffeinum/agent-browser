@@ -463,7 +463,7 @@ mod tests {
             Path::new("/bin/sh"),
             &sh("echo 'no json here'; exec sleep 30"),
             Readiness::AnnouncedPort,
-            Duration::from_millis(400),
+            Duration::from_secs(2),
         )
         .await
         .err()
@@ -498,7 +498,7 @@ mod tests {
             Path::new("/bin/sh"),
             &sh("echo 'still booting' >&2; exec sleep 30"),
             Readiness::Port(port),
-            Duration::from_millis(400),
+            Duration::from_secs(2),
         )
         .await
         .err()

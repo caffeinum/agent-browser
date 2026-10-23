@@ -33,15 +33,44 @@ def flag(name, default=None):
 
 port = int(flag("--port", "0"))
 account = flag("--account")
-state = {"url": "about:blank", "sessions": 0, "origin": 1.0}
+def now_ms():
+    return time.time() * 1000.0
+
+
+# "origin" is the current document's performance.timeOrigin: when the
+# navigation that produced it started (not when it committed).
+state = {"url": "about:blank", "sessions": 0, "origin": now_ms(), "navs": []}
 
 
 def commit_pending_navigation():
-    """A click on a "slowlink" page starts a navigation that commits 1s later."""
+    """A click on a "slowlink" page starts a navigation that commits 1s later.
+
+    On "seq.test", http://seq.test/slow?ms=N commits N ms after it starts, and
+    like WebKit a later navigation does not cancel it: an abandoned one can
+    still commit while a newer command waits.
+    """
     if state.get("commit_at") and time.time() >= state["commit_at"]:
         state["url"] = state.pop("pending")
         state.pop("commit_at")
-        state["origin"] += 1
+        state["origin"] = state.pop("started")
+    due = sorted((n for n in state["navs"] if now_ms() >= n["commit_at"]), key=lambda n: n["commit_at"])
+    for nav in due:
+        state["navs"].remove(nav)
+        state["url"] = nav["url"]
+        state["origin"] = nav["start"]
+
+
+def start_seq_navigation(url):
+    ms = float(url.split("ms=")[1]) if "/slow?ms=" in url else 0.0
+    state["navs"].append({"url": url, "start": now_ms(), "commit_at": now_ms() + ms})
+
+
+def pending_destination():
+    """The Navigation API watcher's view: a navigation this document started."""
+    if state.get("pending"):
+        return state["pending"]
+    mine = [n for n in state["navs"] if n["start"] >= state["origin"]]
+    return mine[-1]["url"] if mine else None
 
 if os.environ.get("FAKE_WD_LOG"):
     with open(os.environ["FAKE_WD_LOG"], "a") as log:
@@ -70,7 +99,15 @@ def execute(script, args=()):
     """Canned answers for agent-browser's DOM-walk scripts (no JS engine here)."""
     commit_pending_navigation()
     if "navigation.addEventListener('navigate'" in script:
-        return {"pending": state.get("pending"), "ready": True, "url": state["url"], "origin": state["origin"]}
+        return {
+            "pending": pending_destination(),
+            "ready": True,
+            "url": state["url"],
+            "origin": state["origin"],
+            "since": state["origin"],
+            "now": now_ms(),
+            "redirected": False,
+        }
     if "__abOpts" in script:
         return ELEMENT if '"resolve"' in script else SNAPSHOT
     if "wanted = arguments[1]" in script:
@@ -128,10 +165,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply({"error": "timeout", "message": "goto timed out"}, 500)
             if "hang.test" in data["url"]:
                 time.sleep(3600)
+            if data["url"].startswith("http://seq.test/"):
+                start_seq_navigation(data["url"])
+                commit_pending_navigation()
+                return self.reply(None)
+            start = now_ms()
             if "slow.test" in data["url"]:
                 time.sleep(2)
             state["url"] = data["url"]
-            state["origin"] += 1
+            state["origin"] = start
             return self.reply(None)
         if self.path == "/session/%s/element" % sid:
             return self.reply(ELEMENT)
@@ -157,9 +199,13 @@ class Handler(BaseHTTPRequestHandler):
             if "slowlink" in state["url"]:
                 state["pending"] = state["url"].split("/slowlink")[0] + "/arrived"
                 state["commit_at"] = time.time() + 1.0
+                state["started"] = now_ms()
+            if state["url"].startswith("http://seq.test/start?ls="):
+                # The page's slow link.
+                start_seq_navigation("http://seq.test/slow?ms=" + state["url"].split("ls=")[1])
             return self.reply(None)
         if self.path == "/session/%s/back" % sid:
-            state["origin"] += 1
+            state["origin"] = now_ms()
             return self.reply(None)
         return self.reply({"error": "unknown command", "message": self.path}, 404)
 

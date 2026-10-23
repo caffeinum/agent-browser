@@ -17324,6 +17324,90 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         close_all_browser_backends(&mut state).await.unwrap();
     }
 
+    /// R4-1: an `open` whose wait sees an earlier, abandoned navigation
+    /// commit must fail with "still on <that page>", not report it as the
+    /// page it opened. The fake, like WebKit, does not cancel a navigation
+    /// that a later one replaced.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_open_rejects_a_late_commit_from_an_abandoned_navigation() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        // Each wait is 80% of 2s: 1.6s.
+        let (mut state, _launch, _log) = launch_fake_webkit_with_limit(dir.path(), 2000).await;
+        let open = |url: &str| json!({ "id": "o", "action": "navigate", "url": url });
+        let get_url = json!({ "id": "u", "action": "url" });
+
+        let start = execute_command(&open("http://seq.test/start?ls=2500"), &mut state).await;
+        assert_eq!(start["success"], true, "{}", start);
+        // The page's slow link: its navigation commits 2.5s later.
+        let click = execute_command(
+            &json!({ "id": "c", "action": "click", "selector": "a" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(click["success"], true, "{}", click);
+        let url = execute_command(&get_url, &mut state).await;
+        assert_eq!(url["success"], false, "{}", url);
+        assert!(
+            url["error"].as_str().unwrap().contains("did not commit"),
+            "{}",
+            url
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let url = execute_command(&get_url, &mut state).await;
+        assert_eq!(
+            url["data"]["url"], "http://seq.test/slow?ms=2500",
+            "{}",
+            url
+        );
+
+        // Abandoned after 1.6s; it still commits 1s later.
+        let slow = execute_command(&open("http://seq.test/slow?ms=2600"), &mut state).await;
+        assert_eq!(slow["success"], false, "{}", slow);
+        assert!(
+            slow["error"].as_str().unwrap().contains("did not start"),
+            "{}",
+            slow
+        );
+        let fast = execute_command(&open("http://seq.test/fast"), &mut state).await;
+        assert_eq!(fast["success"], true, "{}", fast);
+        assert_eq!(fast["data"]["url"], "http://seq.test/fast", "{}", fast);
+
+        // The abandoned navigation commits during this wait.
+        let wanted = execute_command(&open("http://seq.test/slow?ms=30000"), &mut state).await;
+        assert_eq!(
+            wanted["success"], false,
+            "open must not succeed on a page it did not open: {}",
+            wanted
+        );
+        let error = wanted["error"].as_str().unwrap();
+        assert!(
+            error.contains("Navigation to http://seq.test/slow?ms=30000 did not start"),
+            "{}",
+            error
+        );
+        assert!(
+            error.contains("still on http://seq.test/slow?ms=2600"),
+            "{}",
+            error
+        );
+
+        // A navigation that does commit in time is still accepted.
+        let ok = execute_command(&open("http://seq.test/slow?ms=300"), &mut state).await;
+        assert_eq!(ok["success"], true, "{}", ok);
+        assert_eq!(ok["data"]["url"], "http://seq.test/slow?ms=300", "{}", ok);
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
     /// The CLI sends launch before every `-p webkit` command; a reused session
     /// must keep the refs from the previous snapshot.
     #[cfg(unix)]

@@ -7,6 +7,13 @@
 //! - every other page command first waits for a navigation the previous
 //!   command started (seen through the Navigation API `navigate` event) to
 //!   commit and reach DOMContentLoaded, so it never reads the old page.
+//!
+//! WebKit does not always cancel a navigation that a later one replaced, so an
+//! abandoned navigation can still commit while a newer command waits. A
+//! navigation command therefore accepts only a document whose navigation
+//! began after the command dispatched it (`performance.timeOrigin` is the
+//! navigation's start, not its commit), or a back/forward cache restore shown
+//! after that.
 
 use std::time::{Duration, Instant};
 
@@ -29,9 +36,15 @@ if (!w) {
     });
   }
   // A page restored from the back/forward cache is current again.
-  addEventListener('pageshow', function () { w.dest = null; });
+  addEventListener('pageshow', function (e) {
+    w.dest = null;
+    if (e.persisted) w.shown = Date.now();
+  });
 }
-return { pending: w.dest, ready: document.readyState !== 'loading', fresh: fresh, url: location.href, origin: performance.timeOrigin };";
+var nav = performance.getEntriesByType ? performance.getEntriesByType('navigation')[0] : null;
+return { pending: w.dest, ready: document.readyState !== 'loading', fresh: fresh, url: location.href,
+  origin: performance.timeOrigin, since: w.shown || performance.timeOrigin, now: Date.now(),
+  redirected: !!(nav && nav.redirectCount > 0) };";
 
 #[derive(Debug, Clone, PartialEq)]
 struct PageState {
@@ -40,7 +53,15 @@ struct PageState {
     /// The watcher was installed by this call: a document not seen before.
     fresh: bool,
     url: String,
+    /// `performance.timeOrigin`: when this document's navigation started.
     origin: f64,
+    /// When this document became current: its navigation start, or when it
+    /// was restored from the back/forward cache.
+    since: f64,
+    /// The page's clock (`Date.now()`) when the state was read.
+    now: f64,
+    /// The navigation that produced this document followed a redirect.
+    redirected: bool,
 }
 
 /// What a navigation call targets, to tell when it has arrived.
@@ -75,6 +96,16 @@ impl WebDriverBackend {
                 .unwrap_or("")
                 .to_string(),
             origin: value.get("origin").and_then(Value::as_f64).unwrap_or(0.0),
+            since: value
+                .get("since")
+                .or_else(|| value.get("origin"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0),
+            now: value.get("now").and_then(Value::as_f64).unwrap_or(0.0),
+            redirected: value
+                .get("redirected")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 
@@ -171,14 +202,34 @@ impl WebDriverBackend {
     }
 }
 
+/// Whether `now` is the page the navigation command (dispatched right after
+/// `before` was read) produced.
 fn arrived(before: &PageState, now: &PageState, arrival: &Arrival<'_>) -> bool {
-    let new_document = now.origin != before.origin;
+    let same_document = now.origin == before.origin;
+    // A different document counts only if it became current after this
+    // command dispatched its navigation; one from an earlier, abandoned
+    // navigation that commits late does not. 1ms absorbs clock rounding.
+    let new_document = !same_document && now.since >= before.now - 1.0;
     match arrival {
         Arrival::Reload => new_document,
-        Arrival::History => new_document || now.url != before.url,
+        Arrival::History => new_document || (same_document && now.url != before.url),
         Arrival::Url(target) => {
-            new_document || (same_document_target(&before.url, target) && now.url == *target)
+            if same_document {
+                same_document_target(&before.url, target) && now.url == *target
+            } else {
+                // A redirect may land elsewhere, but a new document still at
+                // the old URL without one is not the page that was asked for.
+                new_document
+                    && (same_url(&now.url, target) || now.redirected || now.url != before.url)
+            }
         }
+    }
+}
+
+fn same_url(a: &str, b: &str) -> bool {
+    match (url::Url::parse(a), url::Url::parse(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
     }
 }
 
@@ -201,6 +252,7 @@ fn capitalize(text: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A document whose navigation started at `origin`, read at time 100.
     fn state(url: &str, origin: f64) -> PageState {
         PageState {
             pending: None,
@@ -208,12 +260,23 @@ mod tests {
             fresh: false,
             url: url.to_string(),
             origin,
+            since: origin,
+            now: 100.0,
+            redirected: false,
+        }
+    }
+
+    /// The state read just before a navigation command dispatches, at `now`.
+    fn before(url: &str, origin: f64, now: f64) -> PageState {
+        PageState {
+            now,
+            ..state(url, origin)
         }
     }
 
     #[test]
     fn arrival_needs_a_new_document_or_the_expected_same_document_change() {
-        let before = state("https://a.test/x", 1.0);
+        let before = before("https://a.test/x", 1.0, 1.5);
         assert!(!arrived(
             &before,
             &state("https://a.test/x", 1.0),
@@ -243,6 +306,54 @@ mod tests {
             &before,
             &state("https://a.test/prev", 1.0),
             &Arrival::History
+        ));
+    }
+
+    /// R4-1: a navigation abandoned before this command (started at 5; the
+    /// command dispatched at 20) that commits during the wait is not the page
+    /// open, back or reload asked for.
+    #[test]
+    fn a_late_commit_from_an_earlier_navigation_is_not_arrival() {
+        let b = before("http://s.test/fast", 15.0, 20.0);
+        let target = Arrival::Url("http://s.test/slow?s=30");
+        let stale = state("http://s.test/slow?s=25", 5.0);
+        assert!(!arrived(&b, &stale, &target));
+        assert!(!arrived(
+            &b,
+            &stale,
+            &Arrival::Url("http://s.test/slow?s=25")
+        ));
+        assert!(!arrived(&b, &stale, &Arrival::Reload));
+        assert!(!arrived(&b, &stale, &Arrival::History));
+
+        let ours = state("http://s.test/slow?s=30", 21.0);
+        assert!(arrived(&b, &ours, &target));
+        assert!(arrived(&b, &ours, &Arrival::Reload));
+
+        // A new document still at the old URL, without a redirect, is not
+        // the page asked for; with one it is.
+        let same = state("http://s.test/fast", 21.0);
+        assert!(!arrived(&b, &same, &target));
+        let redirected = PageState {
+            redirected: true,
+            ..same.clone()
+        };
+        assert!(arrived(&b, &redirected, &target));
+        // A redirect elsewhere arrives.
+        assert!(arrived(&b, &state("http://s.test/login", 21.0), &target));
+
+        // A back/forward cache restore shown after the command arrives.
+        let restored = PageState {
+            since: 22.0,
+            ..state("http://s.test/prev", 2.0)
+        };
+        assert!(arrived(&b, &restored, &Arrival::History));
+
+        // URLs compare after parsing.
+        assert!(arrived(
+            &before("http://s.test/", 15.0, 20.0),
+            &state("http://s.test/", 21.0),
+            &Arrival::Url("http://s.test")
         ));
     }
 }
