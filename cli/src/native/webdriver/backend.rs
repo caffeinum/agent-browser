@@ -55,13 +55,37 @@ impl WebDriverBackend {
     /// runs a function body, so without this a bare expression returns null.
     /// A function-body script such as `return document.title` is therefore a
     /// SyntaxError here, exactly as it is on the CDP path.
+    ///
+    /// A single expression is compiled directly into the WebDriver script,
+    /// which page CSP does not govern. Only scripts that are not one
+    /// expression (several statements) go through `eval`, which a page CSP
+    /// without 'unsafe-eval' blocks; that case fails with an explicit error.
     pub async fn evaluate_expression(&self, expression: &str) -> Result<Value, String> {
-        self.client
-            .execute_script(
-                "return (0, eval)(arguments[0]);",
-                vec![Value::String(expression.to_string())],
-            )
+        let single = expression.trim().trim_end_matches(';');
+        match self
+            .client
+            .execute_script(&format!("return (\n{}\n);", single), vec![])
             .await
+        {
+            Err(e) if e.contains("SyntaxError") => self
+                .client
+                .execute_script(
+                    "return (0, eval)(arguments[0]);",
+                    vec![Value::String(expression.to_string())],
+                )
+                .await
+                .map_err(|e| {
+                    if e.contains("unsafe-eval") {
+                        format!(
+                            "{}\nThis page's Content Security Policy blocks eval, so on WebDriver only a single expression can be evaluated here.",
+                            e
+                        )
+                    } else {
+                        e
+                    }
+                }),
+            other => other,
+        }
     }
 
     /// Run a function body (`arguments` available, `return` for the result).

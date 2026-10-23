@@ -126,6 +126,7 @@ agent-browser read https://docs.example.com/guide --outline  # compact page head
 agent-browser read https://docs.example.com --llms index --filter auth  # compact llms.txt discovery
 agent-browser get text @e1                # visible text of an element (capped at 50000 chars)
 agent-browser get text body --max-chars 8000 --links  # bounded page text with [text](href) links
+agent-browser -p webkit --webkit-account agent open https://example.com  # macOS system WebKit via webkit-cli; same snapshot/refs
 agent-browser get html @e1                # innerHTML
 agent-browser get attr @e1 href           # any attribute
 agent-browser get value @e1               # input value

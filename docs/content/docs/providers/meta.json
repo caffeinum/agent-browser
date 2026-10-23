@@ -6,6 +6,7 @@
     "browserbase",
     "browserless",
     "kernel",
-    "remote-agent-browser"
+    "remote-agent-browser",
+    "webkit"
   ]
 }

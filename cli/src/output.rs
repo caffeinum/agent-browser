@@ -4068,7 +4068,9 @@ Options:
   --allow-file-access        Allow file:// URLs to access local files (Chromium only)
   --hide-scrollbars <bool>   Hide native scrollbars in headless Chromium screenshots (default: true)
                              Use --hide-scrollbars false to keep scrollbars visible
-  -p, --provider <name>      Browser provider: ios, browserbase, kernel, browseruse, browserless, agentcore, or plugin name
+  -p, --provider <name>      Browser provider: ios, safari, webkit, browserbase, kernel, browseruse, browserless, agentcore, or plugin name
+  --webkit-account <name>    webkit-cli account for -p webkit (or AGENT_BROWSER_WEBKIT_ACCOUNT); required
+                             -p webkit runs `webkit-cli webdriver --account <name>`; --executable-path names webkit-cli
   --device <name>            iOS device name (e.g., "iPhone 15 Pro")
   --json                     JSON output
   --annotate                 Annotated screenshot with numbered labels and legend
@@ -4168,7 +4170,9 @@ Environment:
   AGENT_BROWSER_CA_CERT          Path to CA certificate to trust (HTTPS interception proxies)
   AGENT_BROWSER_CLEAR_CA_CERT    Clear CA trust retained by the running browser session
   AGENT_BROWSER_USE_SYSTEM_CA    Use the OS trust store for CLI requests
-  AGENT_BROWSER_PROVIDER         Browser provider (ios, browserbase, kernel, browseruse, browserless, agentcore, or plugin name)
+  AGENT_BROWSER_PROVIDER         Browser provider (ios, safari, webkit, browserbase, kernel, browseruse, browserless, agentcore, or plugin name)
+  AGENT_BROWSER_WEBKIT_ACCOUNT   webkit-cli account for -p webkit (--webkit-account takes precedence)
+  AGENT_BROWSER_WEBKIT_CLI       Path to webkit-cli for -p webkit (default: webkit-cli on PATH)
   BROWSER_USE_API_KEY            Browser Use Cloud API key
   BROWSER_USE_PROFILE_ID         Browser Use profile UUID
   BROWSER_USE_PROXY_COUNTRY      Managed proxy country; none/direct disables proxy

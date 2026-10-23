@@ -63,6 +63,8 @@ Client-daemon architecture for optimal performance:
 
 The daemon starts automatically and persists between commands. By default, it saves configured restore state, closes its headless browser, and exits after one hour without commands or dashboard input. Without `--restore` or another restore key, shutdown discards transient browser state and open tabs. Headed browsers, Safari and iOS WebDriver sessions, and user-attached browsers are exempt from the default timeout; provider-owned cloud browsers are not. Use `--idle-timeout <time>` or `AGENT_BROWSER_IDLE_TIMEOUT_MS` to tune the timeout, and use `0` to disable it.
 
+Headless `-p webkit` sessions are not exempt from the default idle timeout.
+
 ## Platforms
 
 Native Rust binaries for macOS (ARM64, x64), Linux (ARM64, x64), and Windows (x64).

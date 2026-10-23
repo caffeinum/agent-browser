@@ -194,8 +194,64 @@ fn build_provider_launch_command(provider: &str, flags: &Flags) -> serde_json::V
     if let Some(ref cs) = flags.color_scheme {
         launch_cmd["colorScheme"] = json!(cs);
     }
+    if provider.eq_ignore_ascii_case("webkit") {
+        attach_webkit_launch_options(&mut launch_cmd, flags);
+    }
 
     launch_cmd
+}
+
+/// `close` must reach the daemon even when the provider session is dead or
+/// absent; launching first would start (or fail on) a browser just to close it.
+fn command_needs_provider_launch(cmd: &serde_json::Value) -> bool {
+    cmd.get("action").and_then(|a| a.as_str()) != Some("close")
+}
+
+/// The webkit provider spawns webkit-cli locally: an explicit
+/// --executable-path names that binary, and --webkit-account (or
+/// AGENT_BROWSER_WEBKIT_ACCOUNT) names its account. An env/config-only
+/// executable path is a Chrome path and is not forwarded.
+fn attach_webkit_launch_options(cmd: &mut serde_json::Value, flags: &Flags) {
+    if flags.cli_executable_path {
+        if let Some(ref path) = flags.executable_path {
+            cmd["executablePath"] = json!(path);
+        }
+    }
+    if let Some(ref account) = flags.webkit_account {
+        cmd["webkitAccount"] = json!(account);
+    }
+}
+
+/// WebDriver providers (webkit, safari, ios) cannot apply these launch or
+/// navigation options; reject them instead of silently ignoring them.
+fn webdriver_provider_option_error(flags: &Flags) -> Option<String> {
+    let provider = flags.provider.as_deref()?.to_ascii_lowercase();
+    if !matches!(provider.as_str(), "webkit" | "safari" | "ios") {
+        return None;
+    }
+    let unsupported = [
+        ("--proxy", flags.proxy.is_some()),
+        ("--headers", flags.headers.is_some()),
+        ("--user-agent", flags.user_agent.is_some()),
+        ("--state", flags.state.is_some()),
+        ("--extension", !flags.extensions.is_empty()),
+        ("--init-script", !flags.init_scripts.is_empty()),
+        ("--enable", !flags.enable.is_empty()),
+        ("--download-path", flags.download_path.is_some()),
+        ("--args", flags.args.is_some()),
+        ("--color-scheme", flags.color_scheme.is_some()),
+        ("--profile", flags.profile.is_some() && provider == "webkit"),
+    ];
+    let (flag, _) = unsupported.iter().find(|(_, set)| *set)?;
+    let hint = if *flag == "--profile" {
+        " (use --webkit-account to pick a webkit-cli account)"
+    } else {
+        ""
+    };
+    Some(format!(
+        "{} is not supported with -p {} (set by flag, env, or config){}",
+        flag, provider, hint
+    ))
 }
 
 fn restore_key_from_flags(flags: &Flags) -> Option<&str> {
@@ -1744,6 +1800,14 @@ fn main() {
         }
         exit(1);
     }
+    if let Some(msg) = webdriver_provider_option_error(&flags) {
+        if flags.json {
+            print_json_error(&msg);
+        } else {
+            eprintln!("{} {}", color::error_indicator(), msg);
+        }
+        exit(1);
+    }
 
     if let Some(ref ca_path) = flags.ca_cert {
         if let Err(msg) = ca_bundle::load(ca_path) {
@@ -1976,7 +2040,11 @@ fn main() {
     }
 
     // Launch with cloud provider if -p flag is set.
-    if let Some(ref provider) = flags.provider {
+    if let Some(provider) = flags
+        .provider
+        .as_ref()
+        .filter(|_| command_needs_provider_launch(&cmd))
+    {
         let launch_cmd = build_provider_launch_command(provider, &flags);
 
         let err = match send_command(launch_cmd, &flags.session) {
@@ -2161,9 +2229,22 @@ fn main() {
     }
 
     let output_opts = OutputOptions::from_flags(&flags);
+    let closing_daemon_pid = (cmd.get("action").and_then(|v| v.as_str()) == Some("close"))
+        .then(|| connection::daemon_pid(&flags.session))
+        .flatten();
 
     match send_command_with_respawn(cmd.clone(), &flags.session, &daemon_opts) {
         Ok(mut resp) => {
+            if let Some(pid) = closing_daemon_pid.filter(|_| resp.success) {
+                if !connection::wait_for_pid_exit(pid, std::time::Duration::from_secs(10)) {
+                    eprintln!(
+                        "{} daemon {} for session {} is still shutting down after close",
+                        color::warning_indicator(),
+                        pid,
+                        flags.session
+                    );
+                }
+            }
             if daemon_restarted {
                 mark_restarted_background(&mut resp);
             }
@@ -2629,6 +2710,95 @@ mod tests {
         let mut disabled_cmd = json!({ "action": "launch" });
         attach_pin_tab_to_command(&mut disabled_cmd, &flags);
         assert_eq!(disabled_cmd["pinTab"], false);
+    }
+
+    #[test]
+    fn test_webkit_provider_launch_forwards_binary_and_account_only() {
+        let mut flags = neutral_launch_config_flags();
+        flags.executable_path = Some("/opt/webkit-cli".to_string());
+        flags.cli_executable_path = true;
+        flags.webkit_account = Some("agent".to_string());
+        flags.profile = Some("Default".to_string());
+
+        let cmd = build_provider_launch_command("webkit", &flags);
+        assert_eq!(cmd["executablePath"], "/opt/webkit-cli");
+        assert_eq!(cmd["webkitAccount"], "agent");
+        assert!(
+            cmd.get("profile").is_none(),
+            "a Chrome profile is never sent"
+        );
+
+        let other = build_provider_launch_command("browserbase", &flags);
+        assert!(other.get("executablePath").is_none());
+        assert!(other.get("webkitAccount").is_none());
+
+        flags.cli_executable_path = false;
+        let env_only = build_provider_launch_command("webkit", &flags);
+        assert!(env_only.get("executablePath").is_none());
+    }
+
+    #[test]
+    fn test_close_skips_the_provider_launch() {
+        assert!(!command_needs_provider_launch(
+            &json!({ "action": "close" })
+        ));
+        assert!(command_needs_provider_launch(&json!({ "action": "url" })));
+        assert!(command_needs_provider_launch(
+            &json!({ "action": "navigate" })
+        ));
+    }
+
+    #[test]
+    fn test_webdriver_providers_reject_unappliable_options() {
+        let base = || {
+            let mut flags = neutral_launch_config_flags();
+            flags.provider = Some("webkit".to_string());
+            flags
+        };
+        assert_eq!(webdriver_provider_option_error(&base()), None);
+        type FlagSetter = Box<dyn Fn(&mut Flags)>;
+        let cases: Vec<(&str, FlagSetter)> = vec![
+            ("--proxy", Box::new(|f| f.proxy = Some("http://p".into()))),
+            ("--headers", Box::new(|f| f.headers = Some("{}".into()))),
+            (
+                "--user-agent",
+                Box::new(|f| f.user_agent = Some("x".into())),
+            ),
+            ("--state", Box::new(|f| f.state = Some("s.json".into()))),
+            ("--extension", Box::new(|f| f.extensions = vec!["e".into()])),
+            (
+                "--init-script",
+                Box::new(|f| f.init_scripts = vec!["i.js".into()]),
+            ),
+            (
+                "--download-path",
+                Box::new(|f| f.download_path = Some("/d".into())),
+            ),
+            (
+                "--profile",
+                Box::new(|f| f.profile = Some("Default".into())),
+            ),
+        ];
+        for (flag, set) in cases {
+            let mut flags = base();
+            set(&mut flags);
+            let err = webdriver_provider_option_error(&flags).unwrap();
+            assert!(
+                err.starts_with(&format!("{} is not supported with -p webkit", flag)),
+                "{}",
+                err
+            );
+        }
+        let mut safari = neutral_launch_config_flags();
+        safari.provider = Some("safari".to_string());
+        safari.proxy = Some("http://p".into());
+        assert!(webdriver_provider_option_error(&safari)
+            .unwrap()
+            .contains("-p safari"));
+        let mut cloud = neutral_launch_config_flags();
+        cloud.provider = Some("browserbase".to_string());
+        cloud.proxy = Some("http://p".into());
+        assert_eq!(webdriver_provider_option_error(&cloud), None);
     }
 
     #[test]

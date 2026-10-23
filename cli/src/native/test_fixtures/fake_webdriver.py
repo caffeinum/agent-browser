@@ -12,6 +12,13 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 args = sys.argv[1:]
+if args[:1] == ["stop"]:
+    # `webkit-cli stop --account NAME`
+    if os.environ.get("FAKE_WD_LOG"):
+        with open(os.environ["FAKE_WD_LOG"], "a") as log:
+            log.write("stop %s\n" % args[args.index("--account") + 1])
+    print(json.dumps({"stopped": True}))
+    sys.exit(0)
 if args[:1] == ["webdriver"]:
     args = args[1:]
 

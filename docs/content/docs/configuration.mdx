@@ -306,6 +306,8 @@ These environment variables configure additional daemon and runtime behavior:
     <tr><td><code>AGENT_BROWSER_STREAM_MAX_WIDTH</code></td><td>Cap the encoded frame width in pixels. Caps the frame only and leaves the page size alone, so pointer coordinates are unaffected.</td><td>the viewport</td></tr>
     <tr><td><code>AGENT_BROWSER_STREAM_MAX_HEIGHT</code></td><td>Cap the encoded frame height in pixels.</td><td>the viewport</td></tr>
     <tr><td><code>AGENT_BROWSER_IDLE_TIMEOUT_MS</code></td><td>Auto-shutdown the daemon after N ms without commands or dashboard input. Set <code>0</code> to disable. Headed browsers, Safari and iOS WebDriver sessions, and user-attached browsers are exempt from the default. Provider-owned cloud browsers are eligible for cleanup, and an explicit value applies to every browser.</td><td><code>3600000</code> (1 hour)</td></tr>
+    <tr><td><code>AGENT_BROWSER_WEBKIT_ACCOUNT</code></td><td>webkit-cli account for the <code>webkit</code> provider (<code>--webkit-account</code> takes precedence). Required.</td><td>(none)</td></tr>
+    <tr><td><code>AGENT_BROWSER_WEBKIT_CLI</code></td><td>Path to webkit-cli for the <code>webkit</code> provider (<code>--executable-path</code> takes precedence).</td><td><code>webkit-cli</code> on PATH</td></tr>
     <tr><td><code>AGENT_BROWSER_IOS_DEVICE</code></td><td>Default iOS device name for the <code>ios</code> provider.</td><td>(none)</td></tr>
     <tr><td><code>AGENT_BROWSER_IOS_UDID</code></td><td>Default iOS device UDID for the <code>ios</code> provider.</td><td>(none)</td></tr>
     <tr><td><code>AGENT_BROWSER_DEBUG</code></td><td>Enable debug output (<code>1</code> to enable).</td><td>(disabled)</td></tr>

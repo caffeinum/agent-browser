@@ -181,6 +181,56 @@ pub fn cleanup_stale_files(session: &str) {
     }
 }
 
+/// The running daemon's PID for `session`, if its pid file exists.
+pub fn daemon_pid(session: &str) -> Option<u32> {
+    fs::read_to_string(get_pid_path(session))
+        .ok()
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
+}
+
+/// Wait for a daemon that acknowledged `close` to finish exiting. The daemon
+/// keeps its socket briefly while it shuts down, so a command sent right
+/// after `close` could otherwise reach the exiting daemon and lose its
+/// response. Returns false if it is still alive at the deadline.
+pub fn wait_for_pid_exit(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while is_pid_alive(pid) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    true
+}
+
+#[cfg(all(test, unix))]
+mod daemon_exit_wait_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn waits_for_an_exiting_process_and_gives_up_on_a_live_one() {
+        let mut quick = std::process::Command::new("sleep")
+            .arg("0.3")
+            .spawn()
+            .unwrap();
+        let pid = quick.id();
+        let reaper = std::thread::spawn(move || quick.wait());
+        let started = Instant::now();
+        assert!(wait_for_pid_exit(pid, Duration::from_secs(5)));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        reaper.join().unwrap().unwrap();
+
+        let mut slow = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        assert!(!wait_for_pid_exit(slow.id(), Duration::from_millis(100)));
+        slow.kill().unwrap();
+        slow.wait().unwrap();
+    }
+}
+
 /// Returns whether a process with the given PID is currently alive.
 ///
 /// On unix, EPERM (process exists but we can't signal it) counts as alive

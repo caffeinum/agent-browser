@@ -562,6 +562,8 @@ AGENT_BROWSER_HIDE_SCROLLBARS="false"        # Keep native scrollbars visible in
 AGENT_BROWSER_WEBGPU="1"                     # Enable the WebGPU launch preset (see references/webgpu.md)
 AGENT_BROWSER_NO_XVFB="1"                    # Disable automatic Xvfb for headed mode on displayless Linux
 AGENT_BROWSER_PROVIDER="browserbase"         # Browser provider or configured provider plugin
+AGENT_BROWSER_WEBKIT_ACCOUNT="agent"         # webkit-cli account for -p webkit (or --webkit-account; required)
+AGENT_BROWSER_WEBKIT_CLI="/path/webkit-cli"  # webkit-cli binary for -p webkit (default: webkit-cli on PATH)
 BROWSER_USE_API_KEY="your-api-key"           # Browser Use Cloud API key
 BROWSER_USE_PROFILE_ID="profile-uuid"        # Optional Browser Use profile UUID
 BROWSER_USE_PROXY_COUNTRY="de"               # Managed proxy country; none/direct disables proxy
@@ -575,5 +577,7 @@ AGENT_BROWSER_PLUGINS='[{"name":"vault","command":"agent-browser-plugin-vault","
 ```
 
 WebDriver sessions (iOS, Safari): `snapshot`, `click`/`fill`/`get text @eN` work with the same snapshot format and refs as Chrome (computed from the DOM; iframes are not expanded). `eval` takes an expression, not a function body.
+
+System WebKit: `agent-browser -p webkit --webkit-account <name> <command>` drives macOS WebKit through `webkit-cli webdriver`. One webkit-cli process per account is reused across commands; `close` stops it. If webkit-cli dies, commands fail until you run `agent-browser close`. Launch options WebKit cannot apply (`--proxy`, `--headers`, `--user-agent`, `--state`, `--profile`, ...) are rejected.
 
 Browser Use Cloud lifecycle: setup is bounded to 18s plus up to 4s for timeout cleanup (10s create, 8s CDP attach, 4s stop). `close` succeeds only after the Cloud session acknowledges it stopped; a failed stop returns an error, keeps the session id for retrying `close`, and blocks a new launch until released. If create fails before an id arrives, the outcome is unknown; inspect the Browser Use Cloud dashboard before retrying. If the daemon exits before a successful stop, inspect and stop the browser in Cloud.

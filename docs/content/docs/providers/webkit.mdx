@@ -1,0 +1,44 @@
+---
+title: "System WebKit"
+navTitle: "WebKit"
+description: "Drive macOS system WebKit headlessly through webkit-cli over WebDriver."
+---
+
+The `webkit` provider drives the macOS system WebKit through [webkit-cli](https://github.com/caffeinum/webkit-cli) 0.4.0 or later. agent-browser runs `webkit-cli webdriver --account <name>` and talks to it over WebDriver. It is built in rather than a `browser.provider` plugin because plugins must return a CDP endpoint.
+
+## Setup
+
+```bash
+webkit-cli create agent
+agent-browser -p webkit --webkit-account agent open https://example.com
+agent-browser -p webkit --webkit-account agent snapshot -i
+agent-browser -p webkit --webkit-account agent click @e1
+agent-browser -p webkit --webkit-account agent get text @e2
+agent-browser close
+```
+
+The account is required and must already exist. A Chrome `--profile` never selects it. Every command with the same account reuses one webkit-cli process and keeps the page. `close` ends the session and runs `webkit-cli stop --account <name>`, which saves the account's cookies and leaves nothing running.
+
+If webkit-cli exits, the next command fails with `webkit WebDriver driver exited` and its output. Run `agent-browser close`, then run the command again.
+
+## Configuration
+
+<table>
+  <thead>
+    <tr><th>Flag or variable</th><th>Description</th><th>Default</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>--webkit-account</code>, <code>AGENT_BROWSER_WEBKIT_ACCOUNT</code></td><td>webkit-cli account. The flag takes precedence.</td><td>(none, required)</td></tr>
+    <tr><td><code>--executable-path</code>, <code>AGENT_BROWSER_WEBKIT_CLI</code></td><td>Path to webkit-cli. The flag takes precedence.</td><td><code>webkit-cli</code> on PATH</td></tr>
+  </tbody>
+</table>
+
+## Supported commands
+
+`open`, `back`, `forward`, `reload`, `snapshot` (including `-i`, `-c`, `-d`, `-s`, and `--urls`), `click`, `fill`, and `get text` with `@ref` or CSS selectors, `get url`, `get title`, `eval`, `screenshot`, `read`, and cookie reads. Snapshots use the same format and refs as Chrome and are computed in the page from the DOM; iframe contents are not expanded. `get text` has the same 50000-character default cap.
+
+`--proxy`, `--headers`, `--user-agent`, `--state`, `--extension`, `--init-script`, `--enable`, `--download-path`, `--args`, `--color-scheme`, `--profile`, `--ca-cert`, and `--allowed-domains` are rejected because WebKit cannot apply them. Tabs, network interception, tracing, and other CDP features are not available. Headless webkit sessions are subject to the default idle timeout, unlike Safari and iOS.
+
+## What was measured
+
+Measured on 2026-10-22 with webkit-cli 0.4.1 on macOS through `agent-browser -p webkit`: the user agent was `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.2 Safari/605.1.15`, `navigator.webdriver` was `false`, and https://www.techspot.com loaded past its Cloudflare check (title "TechSpot | Tech Enthusiasts, Power Users, Gamers"), where headless Chrome stopped at "Just a moment...". Results on other sites and dates may differ.
