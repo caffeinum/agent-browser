@@ -884,3 +884,50 @@ async fn test_daemon_state_new_with_corrupt_binding_does_not_pin() {
     let state = DaemonState::new();
     assert!(!state.pin_tab);
 }
+
+/// Every documented command that is not implemented on WebDriver must say so
+/// by name for `-p webkit`, never "Browser not launched" or an empty success.
+#[tokio::test]
+async fn test_webdriver_sessions_refuse_unsupported_commands_by_name() {
+    use super::actions::{skip_launch_action, BackendType};
+    use super::webdriver::backend::{WebDriverBackend, WEBDRIVER_SUPPORTED_ACTIONS};
+    use super::webdriver::client::WebDriverClient;
+
+    let mut state = DaemonState::new();
+    state.default_timeout_ms = 100;
+    // Port 1 refuses connections, so a command that slipped past the gate
+    // would fail with a connection error instead of the expected message.
+    state.backend_type = BackendType::WebDriver;
+    state.webdriver_backend = Some(WebDriverBackend::new(WebDriverClient::new_with_session(
+        1,
+        "s".to_string(),
+    )));
+    state.webdriver_identity = Some("webkit:agent".to_string());
+
+    let mut refused = 0;
+    for (i, action) in DOCUMENTED_ACTIONS.iter().enumerate() {
+        if skip_launch_action(action)
+            || WEBDRIVER_SUPPORTED_ACTIONS.iter().any(|(a, _)| a == action)
+        {
+            continue;
+        }
+        let cmd = minimal_command(action, &format!("wd-{}", i));
+        let result = execute_command(&cmd, &mut state).await;
+        assert_eq!(result["success"], false, "{}: {}", action, result);
+        let error = result["error"].as_str().unwrap_or("");
+        assert!(
+            error.contains("is not supported on -p webkit (WebDriver); supported: open,")
+                && error.ends_with("; workaround: eval"),
+            "{}: {}",
+            action,
+            error
+        );
+        refused += 1;
+    }
+    assert!(refused > 50, "only {} commands were checked", refused);
+    for network_like in ["network", "console", "errors", "trace_start"] {
+        let cmd = json!({ "id": "n", "action": network_like });
+        let result = execute_command(&cmd, &mut state).await;
+        assert_eq!(result["success"], false, "{}: {}", network_like, result);
+    }
+}

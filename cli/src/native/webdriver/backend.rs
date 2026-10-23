@@ -269,35 +269,92 @@ impl BrowserBackend for WebDriverBackend {
     }
 }
 
-/// CDP-backed backend constants for unsupported actions on WebDriver
-pub const WEBDRIVER_UNSUPPORTED_ACTIONS: &[&str] = &[
-    // axe-core frame injection currently relies on CDP execution contexts.
-    "a11y",
-    "screencast_start",
-    "screencast_stop",
-    "trace_start",
-    "trace_stop",
-    "profiler_start",
-    "profiler_stop",
-    "route",
-    "unroute",
-    "expose",
-    "addscript",
-    "addinitscript",
-    "network",
-    "har_start",
-    "har_stop",
+/// Daemon actions implemented on WebDriver sessions, with the CLI command
+/// each comes from. Everything else is refused up front by
+/// [`unsupported_on_webdriver`] instead of failing deep in a CDP handler.
+pub const WEBDRIVER_SUPPORTED_ACTIONS: &[(&str, &str)] = &[
+    ("navigate", "open"),
+    ("back", "back"),
+    ("forward", "forward"),
+    ("reload", "reload"),
+    ("snapshot", "snapshot"),
+    ("click", "click"),
+    ("fill", "fill"),
+    ("gettext", "get text"),
+    ("url", "get url"),
+    ("title", "get title"),
+    ("content", "get html"),
+    ("evaluate", "eval"),
+    ("screenshot", "screenshot"),
+    ("cookies_get", "cookies"),
 ];
+
+/// iOS adds touch gestures through Appium.
+const IOS_ONLY_ACTIONS: &[&str] = &["tap", "swipe", "device"];
+
+/// `None` when `action` works on a WebDriver session for `provider`
+/// ("webkit", "safari", "ios"); otherwise the error to return. Actions that
+/// never touch the page (`skip_launch` ones) are not passed here.
+pub fn unsupported_on_webdriver(action: &str, provider: &str) -> Option<String> {
+    let supported = WEBDRIVER_SUPPORTED_ACTIONS
+        .iter()
+        .any(|(a, _)| *a == action)
+        || (provider == "ios" && IOS_ONLY_ACTIONS.contains(&action));
+    if supported {
+        return None;
+    }
+    let commands: Vec<&str> = WEBDRIVER_SUPPORTED_ACTIONS
+        .iter()
+        .map(|(_, c)| *c)
+        .collect();
+    Some(format!(
+        "{} is not supported on -p {} (WebDriver); supported: {}; workaround: eval",
+        cli_command_name(action),
+        provider,
+        commands.join(", ")
+    ))
+}
+
+/// The CLI spelling of a daemon action, for messages.
+fn cli_command_name(action: &str) -> String {
+    let known = match action {
+        "network" | "requests" | "network_requests" => "network",
+        "har_start" | "har_stop" => "network har",
+        "route" | "unroute" => "network route",
+        "trace_start" | "trace_stop" => "trace",
+        "profiler_start" | "profiler_stop" => "profiler",
+        "screencast_start" | "screencast_stop" => "screencast",
+        "addscript" | "addinitscript" => "addscript",
+        "tab_new" | "tab_list" | "tab_switch" | "tab_close" => "tab",
+        "setviewport" | "viewport" => "set viewport",
+        "keyboard" | "press" | "keydown" | "keyup" => "press",
+        _ => "",
+    };
+    if known.is_empty() {
+        action.replace('_', " ")
+    } else {
+        known.to_string()
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_unsupported_actions() {
-        assert!(WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&"a11y"));
-        assert!(WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&"screencast_start"));
-        assert!(WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&"trace_start"));
-        assert!(!WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&"navigate"));
+    fn test_supported_actions_pass_and_others_name_the_alternatives() {
+        assert_eq!(unsupported_on_webdriver("navigate", "webkit"), None);
+        assert_eq!(unsupported_on_webdriver("gettext", "safari"), None);
+        let err = unsupported_on_webdriver("trace_start", "webkit").unwrap();
+        assert!(
+            err.starts_with(
+                "trace is not supported on -p webkit (WebDriver); supported: open, back"
+            ),
+            "{}",
+            err
+        );
+        assert!(err.ends_with("; workaround: eval"), "{}", err);
+        assert!(unsupported_on_webdriver("tap", "webkit").is_some());
+        assert_eq!(unsupported_on_webdriver("tap", "ios"), None);
     }
 }

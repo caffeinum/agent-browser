@@ -41,7 +41,7 @@ use super::stream::{self, IdleActivity, StreamServer};
 use super::tab_binding;
 use super::tracing::{self as native_tracing, TracingState};
 use super::webdriver::appium::AppiumManager;
-use super::webdriver::backend::{BrowserBackend, WebDriverBackend, WEBDRIVER_UNSUPPORTED_ACTIONS};
+use super::webdriver::backend::{unsupported_on_webdriver, BrowserBackend, WebDriverBackend};
 use super::webdriver::ios;
 use super::webdriver::safari;
 use super::webdriver::webkit;
@@ -878,6 +878,15 @@ impl DaemonState {
     /// WebDriver-backed Safari and iOS sessions are always headed, while CDP
     /// sessions delegate the decision to BrowserManager. Provider-owned CDP
     /// connections remain eligible because the daemon owns their lifecycle.
+    /// "webkit", "safari" or "ios" for the active WebDriver session.
+    fn webdriver_provider_name(&self) -> String {
+        match self.webdriver_identity.as_deref() {
+            Some(id) if id.starts_with(WEBKIT_IDENTITY_PREFIX) => "webkit".to_string(),
+            Some(id) => id.to_string(),
+            None => "ios".to_string(),
+        }
+    }
+
     /// webkit-cli runs WebKit headless, so unlike Safari and iOS it is not
     /// in front of a person and stays subject to the default idle timeout.
     fn is_headless_webkit(&self) -> bool {
@@ -2754,7 +2763,7 @@ fn provider_plugin_launch_options_from_command(cmd: &Value) -> Value {
     Value::Object(options)
 }
 
-fn skip_launch_action(action: &str) -> bool {
+pub(crate) fn skip_launch_action(action: &str) -> bool {
     if action == INTERNAL_DAEMON_SHUTDOWN_ACTION {
         return true;
     }
@@ -3139,17 +3148,13 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
-    // WebDriver backend: reject unsupported CDP-only actions
-    if matches!(state.backend_type, BackendType::WebDriver)
-        && WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&action)
-    {
-        return error_response(
-            &id,
-            &format!(
-                "Action '{}' is not supported on the WebDriver backend",
-                action
-            ),
-        );
+    // WebDriver sessions: refuse what isn't implemented there by name,
+    // instead of a CDP handler failing with "Browser not launched" or
+    // returning an empty result.
+    if state.browser.is_none() && state.webdriver_backend.is_some() && !skip_launch {
+        if let Some(error) = unsupported_on_webdriver(action, &state.webdriver_provider_name()) {
+            return error_response(&id, &error);
+        }
     }
 
     // A pending confirm/prompt dialog blocks the renderer's main thread, so
@@ -7068,31 +7073,33 @@ async fn handle_gettext(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
-    if let (None, Some(wb)) = (&state.browser, &state.webdriver_backend) {
-        let element =
-            super::webdriver::dom_refs::resolve_element(wb, &state.ref_map, selector).await?;
-        let text = super::webdriver::dom_refs::element_text(wb, &element).await?;
-        let url = wb.get_url().await.unwrap_or_default();
-        return Ok(json!({ "text": text, "origin": url }));
-    }
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
-
     let max_chars = optional_usize(cmd, "maxChars")?;
     let offset = optional_usize(cmd, "offset")?.unwrap_or(0);
     let links = cmd.get("links").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let url = mgr.get_url().await.unwrap_or_default();
-    let text = super::element::get_element_text(
-        &mgr.client,
-        &session_id,
-        &state.ref_map,
-        selector,
-        &state.iframe_sessions,
-        links,
-    )
-    .await
-    .map_err(|e| gettext_not_found_hint(e, selector, &url))?;
+    let (text, url) = if let (None, Some(wb)) = (&state.browser, &state.webdriver_backend) {
+        let url = wb.get_url().await.unwrap_or_default();
+        let element = super::webdriver::dom_refs::resolve_element(wb, &state.ref_map, selector)
+            .await
+            .map_err(|e| gettext_not_found_hint(e, selector, &url))?;
+        let text = super::webdriver::dom_refs::element_text(wb, &element, links).await?;
+        (text, url)
+    } else {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        let session_id = mgr.active_session_id()?.to_string();
+        let url = mgr.get_url().await.unwrap_or_default();
+        let text = super::element::get_element_text(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            &state.iframe_sessions,
+            links,
+        )
+        .await
+        .map_err(|e| gettext_not_found_hint(e, selector, &url))?;
+        (text, url)
+    };
     let window = text_window(&text, offset, max_chars)?;
     let mut response = json!({
         "text": window.text,
@@ -16013,6 +16020,24 @@ mod tests {
         .await;
         assert_eq!(text["success"], true, "{}", text);
         assert_eq!(text["data"]["text"], "Save (clicked 1)");
+        assert_eq!(text["data"]["truncated"], false);
+
+        // The same --max-chars window as on CDP.
+        let capped = execute_command(
+            &json!({ "id": "t2", "action": "gettext", "selector": format!("@{}", ref_id), "maxChars": 4 }),
+            &mut state,
+        )
+        .await;
+        assert!(
+            capped["data"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Save\n\n[truncated: showing chars 0-4 of 16"),
+            "{}",
+            capped
+        );
+        assert_eq!(capped["data"]["truncated"], true);
+        assert_eq!(capped["data"]["nextOffset"], 4);
         close_all_browser_backends(&mut state).await.unwrap();
     }
 

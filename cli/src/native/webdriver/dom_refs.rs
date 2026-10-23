@@ -115,12 +115,23 @@ pub fn element_arg(element_id: &str) -> Value {
     json!({ W3C_ELEMENT_KEY: element_id })
 }
 
-pub async fn element_text(wb: &WebDriverBackend, element_id: &str) -> Result<String, String> {
-    let value = wb
-        .execute_function_body(
-            "var el = arguments[0]; return el.innerText || el.textContent || '';",
-            vec![element_arg(element_id)],
+/// Element text as on CDP: innerText, or with `links` the same
+/// `[text](href)` annotation the CDP path uses.
+pub async fn element_text(
+    wb: &WebDriverBackend,
+    element_id: &str,
+    links: bool,
+) -> Result<String, String> {
+    let body = if links {
+        format!(
+            "return ({}).call(arguments[0]);",
+            crate::native::element::TEXT_WITH_LINKS_JS
         )
+    } else {
+        "var el = arguments[0]; return el.innerText || el.textContent || '';".to_string()
+    };
+    let value = wb
+        .execute_function_body(&body, vec![element_arg(element_id)])
         .await?;
     value
         .as_str()
@@ -295,7 +306,9 @@ mod tests {
     #[tokio::test]
     async fn get_text_rejects_non_string_results() {
         let (port, _server) = fake_driver(vec![json!({ "not": "text" })]).await;
-        let err = element_text(&backend(port), "el-1").await.unwrap_err();
+        let err = element_text(&backend(port), "el-1", false)
+            .await
+            .unwrap_err();
         assert!(err.contains("non-string"), "{}", err);
     }
 
