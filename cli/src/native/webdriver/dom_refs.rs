@@ -316,8 +316,7 @@ mod tests {
     }
 
     /// `eval` on WebDriver has CDP semantics: the expression's value, not a
-    /// function body. This is a breaking change for safari/ios users who wrote
-    /// `eval "return ..."`.
+    /// function body.
     #[tokio::test]
     async fn eval_evaluates_an_expression_like_cdp() {
         let (port, server) = fake_driver(vec![json!("Example Domain")]).await;
