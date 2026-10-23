@@ -41,9 +41,10 @@ use super::stream::{self, IdleActivity, StreamServer};
 use super::tab_binding;
 use super::tracing::{self as native_tracing, TracingState};
 use super::webdriver::appium::AppiumManager;
-use super::webdriver::backend::{BrowserBackend, WebDriverBackend, WEBDRIVER_UNSUPPORTED_ACTIONS};
+use super::webdriver::backend::{unsupported_on_webdriver, BrowserBackend, WebDriverBackend};
 use super::webdriver::ios;
 use super::webdriver::safari;
+use super::webdriver::webkit;
 use super::webmcp;
 
 /// Wait strategy used by `auth_login` when navigating to the login page.
@@ -402,7 +403,7 @@ impl AttachedTarget {
     /// Safari providers are WebDriver-backed and have no CDP attach to resume.
     fn from_launch_command(cmd: &Value) -> Option<Self> {
         Self::named_by(cmd)
-            .filter(|target| !matches!(target, Self::Provider(p) if p == "ios" || p == "safari"))
+            .filter(|target| !matches!(target, Self::Provider(p) if is_webdriver_provider(p)))
     }
 
     fn insert_into(&self, cmd: &mut serde_json::Map<String, Value>) {
@@ -625,6 +626,9 @@ pub struct DaemonState {
     /// Provider identity of the local WebDriver session (e.g. "safari"), used
     /// to reuse it across `-p` commands instead of relaunching the driver.
     pub webdriver_identity: Option<String>,
+    /// Command run after the driver stops on close (webkit-cli's `stop`), so
+    /// the profile's background process does not outlive the session.
+    pub webdriver_stop_command: Option<(std::path::PathBuf, Vec<String>)>,
     pub webdriver_backend: Option<super::webdriver::backend::WebDriverBackend>,
     pub backend_type: BackendType,
     pub ref_map: RefMap,
@@ -781,6 +785,7 @@ impl DaemonState {
             appium: None,
             webdriver_process: None,
             webdriver_identity: None,
+            webdriver_stop_command: None,
             webdriver_backend: None,
             backend_type: BackendType::Cdp,
             ref_map: RefMap::new(),
@@ -873,9 +878,26 @@ impl DaemonState {
     /// WebDriver-backed Safari and iOS sessions are always headed, while CDP
     /// sessions delegate the decision to BrowserManager. Provider-owned CDP
     /// connections remain eligible because the daemon owns their lifecycle.
+    /// "webkit", "safari" or "ios" for the active WebDriver session.
+    fn webdriver_provider_name(&self) -> String {
+        match self.webdriver_identity.as_deref() {
+            Some(id) if id.starts_with(WEBKIT_IDENTITY_PREFIX) => "webkit".to_string(),
+            Some(id) => id.to_string(),
+            None => "ios".to_string(),
+        }
+    }
+
+    /// webkit-cli runs WebKit headless, so unlike Safari and iOS it is not
+    /// in front of a person and stays subject to the default idle timeout.
+    fn is_headless_webkit(&self) -> bool {
+        self.webdriver_identity
+            .as_deref()
+            .is_some_and(|id| id.starts_with(WEBKIT_IDENTITY_PREFIX))
+    }
+
     pub(crate) fn blocks_default_idle_shutdown(&self) -> bool {
         default_idle_shutdown_is_blocked(
-            matches!(self.backend_type, BackendType::WebDriver),
+            matches!(self.backend_type, BackendType::WebDriver) && !self.is_headless_webkit(),
             self.active_provider_connection,
             self.browser
                 .as_ref()
@@ -2651,12 +2673,12 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
 /// because Safari and iOS sessions live outside `state.browser`.
 pub(crate) async fn close_all_browser_backends(state: &mut DaemonState) -> Result<(), String> {
     let close_result = close_current_browser(state).await;
-    close_webdriver_backends(state).await;
-    close_result
+    let webdriver_result = close_webdriver_backends(state).await;
+    close_result.and(webdriver_result)
 }
 
 /// End the WebDriver session and stop its driver (Safari, iOS).
-async fn close_webdriver_backends(state: &mut DaemonState) {
+async fn close_webdriver_backends(state: &mut DaemonState) -> Result<(), String> {
     if let Some(ref mut webdriver) = state.webdriver_backend {
         let _ = webdriver.close().await;
     }
@@ -2671,6 +2693,47 @@ async fn close_webdriver_backends(state: &mut DaemonState) {
     state.webdriver_process = None;
     state.webdriver_identity = None;
     state.backend_type = BackendType::Cdp;
+    match state.webdriver_stop_command.take() {
+        Some((program, args)) => run_stop_command(&program, &args).await,
+        None => Ok(()),
+    }
+}
+
+async fn run_stop_command(program: &std::path::Path, args: &[String]) -> Result<(), String> {
+    let describe = || format!("{} {}", program.display(), args.join(" "));
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("`{}` did not finish within 15s", describe()))?
+    .map_err(|e| format!("Failed to run `{}`: {}", describe(), e))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "`{}` failed ({}): {}",
+        describe(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+/// How to recover a session whose WebDriver driver is gone, naming this
+/// daemon's session so the command works as typed.
+fn webdriver_recovery_hint(state: &DaemonState) -> String {
+    let session = if state.session_id == "default" {
+        String::new()
+    } else {
+        format!(" --session {}", state.session_id)
+    };
+    format!(
+        "Run `agent-browser{} close`, then run your command again",
+        session
+    )
 }
 
 async fn close_after_network_control_failure(
@@ -2700,7 +2763,7 @@ fn provider_plugin_launch_options_from_command(cmd: &Value) -> Value {
     Value::Object(options)
 }
 
-fn skip_launch_action(action: &str) -> bool {
+pub(crate) fn skip_launch_action(action: &str) -> bool {
     if action == INTERNAL_DAEMON_SHUTDOWN_ACTION {
         return true;
     }
@@ -2772,7 +2835,7 @@ fn policy_actions_for_command(
         let provider_launch = env::var("AGENT_BROWSER_PROVIDER")
             .ok()
             .map(|provider| provider.to_lowercase())
-            .filter(|provider| !provider.is_empty() && provider != "ios" && provider != "safari");
+            .filter(|provider| !provider.is_empty() && !is_webdriver_provider(provider));
         if let Some(provider) = provider_launch {
             append_browser_provider_policy_action_for(&mut actions, &provider, &plugins);
         } else {
@@ -3046,7 +3109,27 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             .as_mut()
             .and_then(|driver| driver.exit_report())
         {
-            return error_response(&id, &report);
+            return error_response(
+                &id,
+                &format!("{}. {}", report, webdriver_recovery_hint(state)),
+            );
+        }
+        if let (None, Some(wb)) = (&state.browser, &state.webdriver_backend) {
+            if let Err(busy) = wb.ensure_idle().await {
+                return error_response(&id, &busy);
+            }
+            // A click (or key) may have started a navigation that has not
+            // committed yet; never act on or read the old page.
+            if !matches!(action, "navigate" | "back" | "forward" | "reload") {
+                let limit = std::time::Duration::from_millis(state.timeout_ms(cmd))
+                    .min(std::time::Duration::from_millis(state.default_timeout_ms));
+                if let Err(e) = wb
+                    .settle(super::webdriver::backend::page_load_timeout_below(limit))
+                    .await
+                {
+                    return error_response(&id, &e);
+                }
+            }
         }
         if needs_launch {
             lifecycle_relaunched_browser = restore_transition_closed_browser
@@ -3077,17 +3160,13 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
-    // WebDriver backend: reject unsupported CDP-only actions
-    if matches!(state.backend_type, BackendType::WebDriver)
-        && WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&action)
-    {
-        return error_response(
-            &id,
-            &format!(
-                "Action '{}' is not supported on the WebDriver backend",
-                action
-            ),
-        );
+    // WebDriver sessions: refuse what isn't implemented there by name,
+    // instead of a CDP handler failing with "Browser not launched" or
+    // returning an empty result.
+    if state.browser.is_none() && state.webdriver_backend.is_some() && !skip_launch {
+        if let Some(error) = unsupported_on_webdriver(action, &state.webdriver_provider_name()) {
+            return error_response(&id, &error);
+        }
     }
 
     // A pending confirm/prompt dialog blocks the renderer's main thread, so
@@ -3138,7 +3217,31 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
+    let webdriver_page_command = state.browser.is_none()
+        && state.webdriver_backend.is_some()
+        && super::webdriver::commands::ACTIONS
+            .iter()
+            .any(|(a, _)| *a == action);
     let result = match action {
+        _ if webdriver_page_command => {
+            let timeout_ms = state.timeout_ms(cmd);
+            let provider = state.webdriver_provider_name();
+            match state.webdriver_backend {
+                Some(ref wb) => {
+                    super::webdriver::commands::execute(
+                        action,
+                        cmd,
+                        wb,
+                        &state.ref_map,
+                        timeout_ms,
+                        route_url_matches,
+                        &provider,
+                    )
+                    .await
+                }
+                None => Err("No WebDriver session".to_string()),
+            }
+        }
         "launch" => {
             let webmcp_enabled = cmd
                 .get("webmcp")
@@ -3742,6 +3845,12 @@ fn ensure_allowed_domains_supported_for_launch(
             "safari" => {
                 return Err(
                     "--allowed-domains is not supported with the Safari provider because WebRTC containment cannot be enforced"
+                        .to_string(),
+                );
+            }
+            "webkit" => {
+                return Err(
+                    "--allowed-domains is not supported with the WebKit provider because WebRTC containment cannot be enforced"
                         .to_string(),
                 );
             }
@@ -4361,7 +4470,7 @@ async fn auto_launch_inner(
             storage_state,
         })?;
         // ios/safari are device providers handled via explicit launch command
-        if !p.is_empty() && p != "ios" && p != "safari" {
+        if !p.is_empty() && !is_webdriver_provider(&p) {
             let conn = providers::connect_provider_with_plugins(&p, &plugins).await?;
             if conn.direct_page && !allowed_domains.is_empty() {
                 if let Some(ref ps) = conn.session {
@@ -5278,8 +5387,21 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         state.effective_ca_cert = effective_ca_cert;
         return Ok(json!({ "launched": true, "reused": true, "relaunchedBrowser": false }));
     }
-    state.ref_map.invalidate_all_documents();
-    state.session_setup = SessionSetup::default();
+    // Local WebDriver providers decide for themselves whether they reuse the
+    // running session; a reuse must keep the page's refs.
+    let local_webdriver_launch = provider_name
+        .is_some_and(|p| matches!(p.to_ascii_lowercase().as_str(), "safari" | "webkit"));
+    if !local_webdriver_launch {
+        // Launching Chrome (or attaching to CDP) replaces a WebDriver session;
+        // stop its driver instead of leaving it running unused.
+        if state.webdriver_backend.is_some()
+            && !provider_name.is_some_and(|p| p.eq_ignore_ascii_case("ios"))
+        {
+            close_webdriver_backends(state).await?;
+        }
+        state.ref_map.invalidate_all_documents();
+        state.session_setup = SessionSetup::default();
+    }
 
     let has_cdp = cdp_url.is_some() || cdp_port.is_some();
     super::browser::validate_launch_options(
@@ -5374,6 +5496,13 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
                     state.effective_ca_cert = effective_ca_cert;
                 }
                 return result;
+            }
+            "webkit" => {
+                // WebKit uses the system trust store; a CA bundle can't be applied.
+                if effective_ca_cert.is_some() {
+                    return Err("--ca-cert is not supported with -p webkit".to_string());
+                }
+                return launch_webkit(cmd, state).await;
             }
             _ => {
                 let command_plugins = plugins_from_command_or_env(cmd);
@@ -5524,15 +5653,71 @@ async fn launch_ios(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
     }))
 }
 
+/// Providers driven over a W3C WebDriver session rather than CDP.
+fn is_webdriver_provider(provider: &str) -> bool {
+    matches!(provider, "ios" | "safari" | "webkit")
+}
+
+/// System WebKit via `webkit-cli webdriver`. The binary comes from
+/// `executablePath` (--executable-path), AGENT_BROWSER_WEBKIT_CLI, or PATH;
+/// the account from `webkitAccount` (--webkit-account) or
+/// AGENT_BROWSER_WEBKIT_ACCOUNT. One session per account is reused across
+/// commands.
+async fn launch_webkit(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let binary = webkit::resolve_webkit_cli(cmd.get("executablePath").and_then(|v| v.as_str()))?;
+    let account = webkit::resolve_account(cmd.get("webkitAccount").and_then(|v| v.as_str()))?;
+    let port = match cmd.get("port").and_then(|v| v.as_u64()) {
+        Some(p) => u16::try_from(p).map_err(|_| format!("Invalid WebDriver port: {}", p))?,
+        None => 0,
+    };
+    // webkit-cli enforces the page-load and script timeouts itself, below the
+    // client backstop. With "none", navigations and clicks return once
+    // dispatched and agent-browser waits for readiness itself (readiness.rs),
+    // so a click on a slow link returns like it does on Chrome.
+    let page_load = super::webdriver::backend::page_load_timeout_below(
+        std::time::Duration::from_millis(state.default_timeout_ms),
+    );
+    let page_load_ms = page_load.as_millis() as u64;
+    let mut result = launch_local_webdriver(
+        state,
+        LocalWebDriver {
+            provider: "webkit",
+            driver_label: "webkit-cli",
+            identity: format!("{}{}", WEBKIT_IDENTITY_PREFIX, account),
+            engine: "webkit",
+            capabilities: json!({
+                "pageLoadStrategy": "none",
+                "timeouts": { "pageLoad": page_load_ms, "script": page_load_ms },
+            }),
+            page_load_timeout: Some(page_load),
+            own_page_load: true,
+            stop_command: Some((binary.clone(), webkit::stop_args(&account))),
+        },
+        || async {
+            webkit::require_supported_version(&binary).await?;
+            webkit::launch_webkit_cli(&binary, &account, port).await
+        },
+    )
+    .await?;
+    result["account"] = json!(account);
+    Ok(result)
+}
+
+const WEBKIT_IDENTITY_PREFIX: &str = "webkit:";
+
 async fn launch_safari(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let port = driver_port_from_command(cmd)?;
     launch_local_webdriver(
         state,
         LocalWebDriver {
             provider: "safari",
+            driver_label: "safaridriver",
             identity: "safari".to_string(),
             engine: "safari",
             capabilities: json!({ "browserName": "safari" }),
+            stop_command: None,
+            page_load_timeout: None,
+            own_page_load: false,
         },
         || safari::launch_safaridriver(port),
     )
@@ -5550,10 +5735,18 @@ fn driver_port_from_command(cmd: &Value) -> Result<u16, String> {
 
 struct LocalWebDriver {
     provider: &'static str,
+    /// Driver name in messages, e.g. "webkit-cli is still loading ...".
+    driver_label: &'static str,
     /// Provider plus anything that selects a different browser profile.
     identity: String,
     engine: &'static str,
     capabilities: Value,
+    /// Run on close after the driver stops (program, args).
+    stop_command: Option<(std::path::PathBuf, Vec<String>)>,
+    /// Page-load timeout the driver enforces for this session, if any.
+    page_load_timeout: Option<std::time::Duration>,
+    /// The driver returns before pages load and agent-browser waits itself.
+    own_page_load: bool,
 }
 
 /// Launch a locally spawned WebDriver server, or reuse the live session when
@@ -5572,7 +5765,10 @@ where
         Output = Result<super::webdriver::driver_process::DriverProcess, String>,
     >,
 {
-    if local_webdriver_is_live(state, &spec.identity).await {
+    if state.webdriver_identity.as_deref() == Some(spec.identity.as_str()) {
+        // Never relaunch silently over a session that died: the page and
+        // refs are gone, and the caller has to know.
+        check_local_webdriver_alive(state, spec.provider).await?;
         return Ok(json!({
             "launched": true,
             "reused": true,
@@ -5580,16 +5776,30 @@ where
             "backend": "webdriver",
         }));
     }
-    close_webdriver_backends(state).await;
+    let replaced = state.webdriver_identity.clone();
+    close_webdriver_backends(state).await?;
+    state.ref_map.invalidate_all_documents();
+    state.session_setup = SessionSetup::default();
 
     let driver = spawn().await?;
     let port = driver.port;
     let mut client = super::webdriver::client::WebDriverClient::new(port);
+    client.set_limits(super::webdriver::client::Limits::uniform(
+        std::time::Duration::from_millis(state.default_timeout_ms),
+    ));
     client.create_session(spec.capabilities).await?;
 
     state.webdriver_process = Some(driver);
-    state.webdriver_backend = Some(WebDriverBackend::new(client));
+    let mut backend = WebDriverBackend::new(client).with_label(spec.driver_label);
+    if let Some(timeout) = spec.page_load_timeout {
+        backend = backend.with_page_load_timeout(timeout);
+    }
+    if spec.own_page_load {
+        backend = backend.with_own_page_load();
+    }
+    state.webdriver_backend = Some(backend);
     state.webdriver_identity = Some(spec.identity);
+    state.webdriver_stop_command = spec.stop_command;
     state.backend_type = BackendType::WebDriver;
     state.engine = spec.engine.to_string();
     write_engine_file(&state.session_id, &state.engine);
@@ -5597,26 +5807,57 @@ where
     write_extensions_file(&state.session_id);
     state.reset_input_state();
 
-    Ok(json!({
+    let mut result = json!({
         "launched": true,
         "provider": spec.provider,
         "port": port,
         "backend": "webdriver",
-    }))
+    });
+    if let Some(previous) = replaced {
+        result["notice"] = json!(format!(
+            "Closed the previous {} session ({}) to start {}; its page and refs are gone",
+            spec.provider,
+            describe_webdriver_identity(&previous),
+            describe_webdriver_identity(state.webdriver_identity.as_deref().unwrap_or(""))
+        ));
+    }
+    Ok(result)
 }
 
-async fn local_webdriver_is_live(state: &mut DaemonState, identity: &str) -> bool {
-    if state.webdriver_identity.as_deref() != Some(identity) {
-        return false;
+fn describe_webdriver_identity(identity: &str) -> String {
+    match identity.strip_prefix(WEBKIT_IDENTITY_PREFIX) {
+        Some(account) => format!("webkit-cli account {}", account),
+        None => identity.to_string(),
     }
-    let driver_running = state
+}
+
+async fn check_local_webdriver_alive(
+    state: &mut DaemonState,
+    provider: &str,
+) -> Result<(), String> {
+    if let Some(report) = state
         .webdriver_process
         .as_mut()
-        .is_some_and(|driver| driver.exit_report().is_none());
-    match state.webdriver_backend {
-        Some(ref wb) if driver_running => wb.get_url().await.is_ok(),
-        _ => false,
+        .and_then(|driver| driver.exit_report())
+    {
+        return Err(format!("{}. {}", report, webdriver_recovery_hint(state)));
     }
+    let probe = match state.webdriver_backend {
+        Some(ref wb) => match wb.ensure_idle().await {
+            Ok(()) => wb.get_url().await.map(|_| ()),
+            // Busy is not dead: the session is kept and the caller told why.
+            Err(busy) => return Err(busy),
+        },
+        None => Err("no WebDriver session".to_string()),
+    };
+    probe.map_err(|e| {
+        format!(
+            "{} WebDriver session is not responding ({}). {}",
+            provider,
+            e,
+            webdriver_recovery_hint(state)
+        )
+    })
 }
 
 async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -5637,7 +5878,8 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         if state.browser.is_none() {
             state.webmcp.clear_invocations();
             state.ref_map.invalidate_all_documents();
-            wb.navigate(url).await?;
+            let limit = std::time::Duration::from_millis(state.timeout_ms(cmd));
+            wb.navigate_within(url, limit).await?;
             let new_url = wb.get_url().await.unwrap_or_else(|_| url.to_string());
             let title = wb.get_title().await.unwrap_or_default();
             return Ok(json!({ "url": new_url, "title": title }));
@@ -6920,31 +7162,33 @@ async fn handle_gettext(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
-    if let (None, Some(wb)) = (&state.browser, &state.webdriver_backend) {
-        let element =
-            super::webdriver::dom_refs::resolve_element(wb, &state.ref_map, selector).await?;
-        let text = super::webdriver::dom_refs::element_text(wb, &element).await?;
-        let url = wb.get_url().await.unwrap_or_default();
-        return Ok(json!({ "text": text, "origin": url }));
-    }
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
-
     let max_chars = optional_usize(cmd, "maxChars")?;
     let offset = optional_usize(cmd, "offset")?.unwrap_or(0);
     let links = cmd.get("links").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let url = mgr.get_url().await.unwrap_or_default();
-    let text = super::element::get_element_text(
-        &mgr.client,
-        &session_id,
-        &state.ref_map,
-        selector,
-        &state.iframe_sessions,
-        links,
-    )
-    .await
-    .map_err(|e| gettext_not_found_hint(e, selector, &url))?;
+    let (text, url) = if let (None, Some(wb)) = (&state.browser, &state.webdriver_backend) {
+        let url = wb.get_url().await.unwrap_or_default();
+        let element = super::webdriver::dom_refs::resolve_element(wb, &state.ref_map, selector)
+            .await
+            .map_err(|e| gettext_not_found_hint(e, selector, &url))?;
+        let text = super::webdriver::dom_refs::element_text(wb, &element, links).await?;
+        (text, url)
+    } else {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        let session_id = mgr.active_session_id()?.to_string();
+        let url = mgr.get_url().await.unwrap_or_default();
+        let text = super::element::get_element_text(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            &state.iframe_sessions,
+            links,
+        )
+        .await
+        .map_err(|e| gettext_not_found_hint(e, selector, &url))?;
+        (text, url)
+    };
     let window = text_window(&text, offset, max_chars)?;
     let mut response = json!({
         "text": window.text,
@@ -15756,18 +16000,23 @@ mod tests {
             "fake-driver",
             std::path::Path::new("/bin/sh"),
             &["-c".to_string(), script],
-            port,
+            crate::native::webdriver::driver_process::Readiness::Port(port),
             std::time::Duration::from_secs(10),
         )
         .await
+        .map_err(String::from)
     }
 
     fn fake_local_spec(identity: &str) -> LocalWebDriver {
         LocalWebDriver {
             provider: "safari",
+            driver_label: "fake-driver",
             identity: identity.to_string(),
             engine: "safari",
             capabilities: json!({}),
+            stop_command: None,
+            page_load_timeout: None,
+            own_page_load: false,
         }
     }
 
@@ -15809,6 +16058,100 @@ mod tests {
             handle_url(&state).await.unwrap()["url"],
             "https://example.com/kept"
         );
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    /// type, press, select, and get count/value through the daemon on a
+    /// WebDriver session (fake driver; the real run is in the PR evidence).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_webdriver_page_commands_use_webdriver_endpoints() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("launches.log");
+        let mut state = DaemonState::new();
+        launch_local_webdriver(&mut state, fake_local_spec("safari"), || {
+            spawn_fake_local_driver(&log)
+        })
+        .await
+        .unwrap();
+        let snap = execute_command(
+            &json!({ "id": "s", "action": "snapshot", "interactive": true }),
+            &mut state,
+        )
+        .await;
+        let tree = snap["data"]["snapshot"].as_str().unwrap().to_string();
+        let target = format!(
+            "@{}",
+            tree.split("ref=").nth(1).unwrap().trim_end_matches(']')
+        );
+        let typed = execute_command(
+            &json!({ "id": "t", "action": "type", "selector": target, "text": "Ada" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(typed["data"]["typed"], "Ada", "{}", typed);
+        let value = execute_command(
+            &json!({ "id": "v", "action": "inputvalue", "selector": target }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(value["data"]["value"], "Ada", "{}", value);
+        let cleared = execute_command(&json!({ "id": "t2", "action": "type", "selector": target, "text": "Bo", "clear": true }), &mut state).await;
+        assert_eq!(cleared["success"], true, "{}", cleared);
+        let value = execute_command(
+            &json!({ "id": "v2", "action": "inputvalue", "selector": target }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(value["data"]["value"], "Bo", "{}", value);
+
+        let pressed = execute_command(
+            &json!({ "id": "p", "action": "press", "key": "Enter" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(pressed["data"]["pressed"], "Enter", "{}", pressed);
+        let unknown = execute_command(
+            &json!({ "id": "p2", "action": "press", "key": "Hyper+x" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(unknown["success"], false, "{}", unknown);
+
+        let selected = execute_command(
+            &json!({ "id": "sel", "action": "select", "selector": target, "values": ["pro"] }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(selected["data"]["selected"], json!(["pro"]), "{}", selected);
+        let missing = execute_command(
+            &json!({ "id": "sel2", "action": "select", "selector": target, "values": ["nope"] }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(missing["success"], false, "{}", missing);
+        assert!(
+            missing["error"]
+                .as_str()
+                .unwrap()
+                .contains("no option [\"nope\"]"),
+            "{}",
+            missing
+        );
+
+        let count = execute_command(
+            &json!({ "id": "c", "action": "count", "selector": ".item" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(count["data"]["count"], 3, "{}", count);
         close_all_browser_backends(&mut state).await.unwrap();
     }
 
@@ -15862,6 +16205,24 @@ mod tests {
         .await;
         assert_eq!(text["success"], true, "{}", text);
         assert_eq!(text["data"]["text"], "Save (clicked 1)");
+        assert_eq!(text["data"]["truncated"], false);
+
+        // The same --max-chars window as on CDP.
+        let capped = execute_command(
+            &json!({ "id": "t2", "action": "gettext", "selector": format!("@{}", ref_id), "maxChars": 4 }),
+            &mut state,
+        )
+        .await;
+        assert!(
+            capped["data"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Save\n\n[truncated: showing chars 0-4 of 16"),
+            "{}",
+            capped
+        );
+        assert_eq!(capped["data"]["truncated"], true);
+        assert_eq!(capped["data"]["nextOffset"], 4);
         close_all_browser_backends(&mut state).await.unwrap();
     }
 
@@ -15946,7 +16307,7 @@ mod tests {
             "fake-driver",
             std::path::Path::new("/bin/sh"),
             &["-c".to_string(), script],
-            port,
+            crate::native::webdriver::driver_process::Readiness::Port(port),
             std::time::Duration::from_secs(10),
         )
         .await
@@ -15965,7 +16326,11 @@ mod tests {
             "{}",
             error
         );
-        assert!(error.contains("run launch again"), "{}", error);
+        assert!(
+            error.contains("Run `agent-browser close`, then run your command again"),
+            "{}",
+            error
+        );
         assert!(error.contains("driver crashed"), "{}", error);
         assert!(state.browser.is_none());
     }
@@ -16493,6 +16858,719 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         );
         assert!(default_idle_shutdown_is_blocked(false, false, true));
         assert!(default_idle_shutdown_is_blocked(true, true, false));
+    }
+
+    #[test]
+    fn test_only_headed_webdriver_sessions_block_default_idle_shutdown() {
+        let mut state = DaemonState::new();
+        state.backend_type = BackendType::WebDriver;
+        state.webdriver_identity = Some("safari".to_string());
+        assert!(
+            state.blocks_default_idle_shutdown(),
+            "Safari is in front of a person"
+        );
+        state.webdriver_identity = None;
+        assert!(
+            state.blocks_default_idle_shutdown(),
+            "iOS is in front of a person"
+        );
+        state.webdriver_identity = Some(format!("{}agent", WEBKIT_IDENTITY_PREFIX));
+        assert!(
+            !state.blocks_default_idle_shutdown(),
+            "headless webkit must stay subject to the idle timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    fn fake_webkit_cli(dir: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/native/test_fixtures/fake_webdriver.py"
+        );
+        let bin = dir.join("webkit-cli");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nFAKE_WD_LOG={} exec python3 {} \"$@\"\n",
+                log.display(),
+                fixture
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// `-p webkit` sends launch before every command: the same account keeps
+    /// one webkit-cli process and its page; another account replaces it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_webkit_launch_reuses_one_webkit_cli_per_account() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("launches.log");
+        let bin = fake_webkit_cli(dir.path(), &log);
+        let launch = |account: &str| {
+            json!({
+                "action": "launch",
+                "provider": "webkit",
+                "executablePath": bin.to_str().unwrap(),
+                "webkitAccount": account,
+            })
+        };
+        let mut state = DaemonState::new();
+
+        let first = handle_launch(&launch("ab-test"), &mut state).await.unwrap();
+        assert_eq!(first["provider"], "webkit");
+        assert_eq!(first["account"], "ab-test");
+        assert_eq!(state.engine, "webkit");
+        handle_navigate(&json!({ "url": "https://example.com/kept" }), &mut state)
+            .await
+            .unwrap();
+
+        let second = handle_launch(&launch("ab-test"), &mut state).await.unwrap();
+        assert_eq!(second["reused"], true, "{}", second);
+        assert_eq!(
+            handle_url(&state).await.unwrap()["url"],
+            "https://example.com/kept"
+        );
+
+        let other = handle_launch(&launch("ab-other"), &mut state)
+            .await
+            .unwrap();
+        assert!(other.get("reused").is_none(), "{}", other);
+        assert_eq!(other["notice"], "Closed the previous webkit session (webkit-cli account ab-test) to start webkit-cli account ab-other; its page and refs are gone");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "launch ab-test\nstop ab-test\nlaunch ab-other\n"
+        );
+        assert!(state.effective_ca_cert.is_none());
+        close_all_browser_backends(&mut state).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "launch ab-test\nstop ab-test\nlaunch ab-other\nstop ab-other\n",
+            "close must stop the webkit-cli account it started"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn launch_fake_webkit_with_limit(
+        dir: &std::path::Path,
+        limit_ms: u64,
+    ) -> (DaemonState, Value, std::path::PathBuf) {
+        let log = dir.join("launches.log");
+        let bin = fake_webkit_cli(dir, &log);
+        let launch = json!({
+            "id": "l",
+            "action": "launch",
+            "provider": "webkit",
+            "executablePath": bin.to_str().unwrap(),
+            "webkitAccount": "ab-test",
+        });
+        let mut state = DaemonState::new();
+        state.default_timeout_ms = limit_ms;
+        let launched = execute_command(&launch, &mut state).await;
+        assert_eq!(launched["success"], true, "{}", launched);
+        (state, launch, log)
+    }
+
+    fn python3_available() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    /// A navigation that never finishes returns within its limit, naming
+    /// the URL and the limit; commands meanwhile fail fast (the driver answers
+    /// nothing else while loading), and close still works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stuck_webkit_navigation_is_bounded_and_close_still_works() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, launch, log) = launch_fake_webkit_with_limit(dir.path(), 800).await;
+
+        let started = std::time::Instant::now();
+        let open = execute_command(
+            &json!({ "id": "o", "action": "navigate", "url": "http://hang.test/" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(open["success"], false, "{}", open);
+        let error = open["error"].as_str().unwrap();
+        assert!(error.contains("http://hang.test/"), "{}", error);
+        assert!(error.contains("within 0.8s"), "{}", error);
+        assert!(
+            error.contains("webkit-cli is still loading http://hang.test/"),
+            "{}",
+            error
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        for cmd in [
+            json!({ "id": "u", "action": "url" }),
+            json!({ "id": "s", "action": "snapshot", "interactive": true }),
+            launch.clone(),
+        ] {
+            let started = std::time::Instant::now();
+            let resp = execute_command(&cmd, &mut state).await;
+            assert_eq!(resp["success"], false, "{}", resp);
+            assert!(
+                resp["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("webkit-cli is still loading http://hang.test/"),
+                "{}",
+                resp
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(3),
+                "{} was slow",
+                cmd
+            );
+        }
+
+        let started = std::time::Instant::now();
+        let close = execute_command(&json!({ "id": "c", "action": "close" }), &mut state).await;
+        assert_eq!(close["success"], true, "{}", close);
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        assert!(std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("stop ab-test"));
+    }
+
+    /// webkit-cli 0.5.0 enforces the session pageLoad (requested below the
+    /// client backstop) and answers 500 `timeout`; that maps to a clear error
+    /// and the next command runs normally.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_driver_page_load_timeout_is_reported_and_session_stays_usable() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _launch, _log) = launch_fake_webkit_with_limit(dir.path(), 1000).await;
+
+        let started = std::time::Instant::now();
+        let open = execute_command(
+            &json!({ "id": "o", "action": "navigate", "url": "http://deadline.test/" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(open["success"], false, "{}", open);
+        assert_eq!(
+            open["error"],
+            "Navigation to http://deadline.test/ did not finish within 0.8s; the page may be partly loaded"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1000),
+            "driver timeout must come before the backstop"
+        );
+
+        let url = execute_command(&json!({ "id": "u", "action": "url" }), &mut state).await;
+        assert_eq!(url["data"]["url"], "http://deadline.test/", "{}", url);
+
+        // A per-command --timeout moves the driver's pageLoad below it too.
+        let longer = execute_command(
+            &json!({ "id": "o2", "action": "navigate", "url": "http://deadline.test/again", "timeout": 2000 }),
+            &mut state,
+        )
+        .await;
+        assert!(
+            longer["error"]
+                .as_str()
+                .unwrap()
+                .contains("did not finish within 1.6s"),
+            "{}",
+            longer
+        );
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_webkit_cli_older_than_0_5_is_refused_at_launch() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+            "FAKE_WD_VERSION",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        guard.set("FAKE_WD_VERSION", "webkit-cli 0.4.2");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("launches.log");
+        let bin = fake_webkit_cli(dir.path(), &log);
+        let mut state = DaemonState::new();
+        let err = handle_launch(
+            &json!({
+                "action": "launch",
+                "provider": "webkit",
+                "executablePath": bin.to_str().unwrap(),
+                "webkitAccount": "ab-test",
+            }),
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("webkit-cli 0.4.2"), "{}", err);
+        assert!(err.contains("needs 0.5.0 or later"), "{}", err);
+        assert!(!log.exists(), "an old webkit-cli must not be started");
+    }
+
+    /// Once a slow load finishes, the session is usable again; click and back
+    /// are bounded the same way.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_webkit_recovers_after_a_slow_load_and_bounds_click_and_back() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _launch, _log) = launch_fake_webkit_with_limit(dir.path(), 800).await;
+
+        let slow = execute_command(
+            &json!({ "id": "o", "action": "navigate", "url": "http://slow.test/" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(slow["success"], false, "{}", slow);
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let url = execute_command(&json!({ "id": "u", "action": "url" }), &mut state).await;
+        assert_eq!(url["data"]["url"], "http://slow.test/", "{}", url);
+
+        let page = execute_command(
+            &json!({ "id": "o2", "action": "navigate", "url": "http://ok.test/hang-later" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(page["success"], true, "{}", page);
+        let snap = execute_command(
+            &json!({ "id": "s", "action": "snapshot", "interactive": true }),
+            &mut state,
+        )
+        .await;
+        let tree = snap["data"]["snapshot"].as_str().unwrap().to_string();
+        let ref_id = tree
+            .split("ref=")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(']')
+            .to_string();
+        let started = std::time::Instant::now();
+        let click = execute_command(
+            &json!({ "id": "c", "action": "click", "selector": format!("@{}", ref_id) }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(click["success"], false, "{}", click);
+        let error = click["error"].as_str().unwrap();
+        assert!(
+            error.contains("Navigation started by a click on http://ok.test/hang-later did not finish within 0.8s"),
+            "{}",
+            error
+        );
+        assert!(error.contains("within 0.8s"), "{}", error);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        close_all_browser_backends(&mut state).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _launch, _log) = launch_fake_webkit_with_limit(dir.path(), 800).await;
+        execute_command(
+            &json!({ "id": "o", "action": "navigate", "url": "http://ok.test/hang-later" }),
+            &mut state,
+        )
+        .await;
+        let back = execute_command(&json!({ "id": "b", "action": "back" }), &mut state).await;
+        assert_eq!(back["success"], false, "{}", back);
+        assert!(
+            back["error"]
+                .as_str()
+                .unwrap()
+                .contains("Navigation back did not finish within 0.8s"),
+            "{}",
+            back
+        );
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    /// Launching a CDP browser replaces a WebDriver session and stops its
+    /// driver (and webkit-cli's account) instead of leaving it running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_switching_to_a_cdp_browser_stops_the_webdriver_driver() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _launch, log) = launch_fake_webkit_with_limit(dir.path(), 2000).await;
+        let pid = state.webdriver_process.as_ref().unwrap().pid().unwrap() as i32;
+        let closed_port = crate::native::webdriver::driver_process::pick_free_port().unwrap();
+
+        let _ = handle_launch(
+            &json!({ "action": "launch", "cdpPort": closed_port }),
+            &mut state,
+        )
+        .await;
+
+        assert!(state.webdriver_backend.is_none());
+        assert!(state.webdriver_process.is_none());
+        assert!(std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("stop ab-test"));
+        assert!(
+            unsafe { libc::kill(pid, 0) } != 0,
+            "webkit-cli must have exited"
+        );
+    }
+
+    /// With pageLoadStrategy "none" a click returns once dispatched; the next
+    /// read waits for the navigation it started to commit, so `get url` and
+    /// `get text` right after the click see the new page.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_reads_after_a_navigating_click_see_the_new_page() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _launch, _log) = launch_fake_webkit_with_limit(dir.path(), 5000).await;
+        let open = execute_command(
+            &json!({ "id": "o", "action": "navigate", "url": "http://site.test/slowlink" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(open["success"], true, "{}", open);
+        let snap = execute_command(
+            &json!({ "id": "s", "action": "snapshot", "interactive": true }),
+            &mut state,
+        )
+        .await;
+        let tree = snap["data"]["snapshot"].as_str().unwrap().to_string();
+        let target = format!(
+            "@{}",
+            tree.split("ref=").nth(1).unwrap().trim_end_matches(']')
+        );
+
+        let started = std::time::Instant::now();
+        let click = execute_command(
+            &json!({ "id": "c", "action": "click", "selector": target }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(click["success"], true, "{}", click);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(800),
+            "click must not wait for the load"
+        );
+
+        let url = execute_command(&json!({ "id": "u", "action": "url" }), &mut state).await;
+        assert_eq!(url["data"]["url"], "http://site.test/arrived", "{}", url);
+        let text = execute_command(
+            &json!({ "id": "t", "action": "gettext", "selector": "body" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(text["data"]["text"], "Arrived page", "{}", text);
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    /// R4-1: an `open` whose wait sees an earlier, abandoned navigation
+    /// commit must fail with "still on <that page>", not report it as the
+    /// page it opened. The fake, like WebKit, does not cancel a navigation
+    /// that a later one replaced.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_open_rejects_a_late_commit_from_an_abandoned_navigation() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        // Each wait is 80% of 2s: 1.6s.
+        let (mut state, _launch, _log) = launch_fake_webkit_with_limit(dir.path(), 2000).await;
+        let open = |url: &str| json!({ "id": "o", "action": "navigate", "url": url });
+        let get_url = json!({ "id": "u", "action": "url" });
+
+        let start = execute_command(&open("http://seq.test/start?ls=2500"), &mut state).await;
+        assert_eq!(start["success"], true, "{}", start);
+        // The page's slow link: its navigation commits 2.5s later.
+        let click = execute_command(
+            &json!({ "id": "c", "action": "click", "selector": "a" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(click["success"], true, "{}", click);
+        let url = execute_command(&get_url, &mut state).await;
+        assert_eq!(url["success"], false, "{}", url);
+        assert!(
+            url["error"].as_str().unwrap().contains("did not commit"),
+            "{}",
+            url
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let url = execute_command(&get_url, &mut state).await;
+        assert_eq!(
+            url["data"]["url"], "http://seq.test/slow?ms=2500",
+            "{}",
+            url
+        );
+
+        // Abandoned after 1.6s; it still commits 1s later.
+        let slow = execute_command(&open("http://seq.test/slow?ms=2600"), &mut state).await;
+        assert_eq!(slow["success"], false, "{}", slow);
+        assert!(
+            slow["error"].as_str().unwrap().contains("did not start"),
+            "{}",
+            slow
+        );
+        let fast = execute_command(&open("http://seq.test/fast"), &mut state).await;
+        assert_eq!(fast["success"], true, "{}", fast);
+        assert_eq!(fast["data"]["url"], "http://seq.test/fast", "{}", fast);
+
+        // The abandoned navigation commits during this wait.
+        let wanted = execute_command(&open("http://seq.test/slow?ms=30000"), &mut state).await;
+        assert_eq!(
+            wanted["success"], false,
+            "open must not succeed on a page it did not open: {}",
+            wanted
+        );
+        let error = wanted["error"].as_str().unwrap();
+        assert!(
+            error.contains("Navigation to http://seq.test/slow?ms=30000 did not start"),
+            "{}",
+            error
+        );
+        assert!(
+            error.contains("still on http://seq.test/slow?ms=2600"),
+            "{}",
+            error
+        );
+
+        // A navigation that does commit in time is still accepted.
+        let ok = execute_command(&open("http://seq.test/slow?ms=300"), &mut state).await;
+        assert_eq!(ok["success"], true, "{}", ok);
+        assert_eq!(ok["data"]["url"], "http://seq.test/slow?ms=300", "{}", ok);
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    /// The CLI sends launch before every `-p webkit` command; a reused session
+    /// must keep the refs from the previous snapshot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_webkit_refs_survive_the_per_command_launch() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_webkit_cli(dir.path(), &dir.path().join("launches.log"));
+        let launch = json!({
+            "id": "l",
+            "action": "launch",
+            "provider": "webkit",
+            "executablePath": bin.to_str().unwrap(),
+            "webkitAccount": "ab-test",
+        });
+        let mut state = DaemonState::new();
+        assert_eq!(execute_command(&launch, &mut state).await["success"], true);
+        let snap = execute_command(
+            &json!({ "id": "s", "action": "snapshot", "interactive": true }),
+            &mut state,
+        )
+        .await;
+        let tree = snap["data"]["snapshot"].as_str().unwrap().to_string();
+        let ref_id = tree
+            .split("ref=")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(']')
+            .to_string();
+
+        let again = execute_command(&launch, &mut state).await;
+        assert_eq!(again["data"]["reused"], true, "{}", again);
+        let click = execute_command(
+            &json!({ "id": "c", "action": "click", "selector": format!("@{}", ref_id) }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(click["success"], true, "ref lost across launch: {}", click);
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    /// A dead webkit-cli is reported on the next command instead of being
+    /// silently replaced by a fresh about:blank session, and the advertised
+    /// recovery (close, then retry) works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_dead_webkit_driver_fails_loudly_and_close_recovers() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("launches.log");
+        let bin = fake_webkit_cli(dir.path(), &log);
+        let launch = json!({
+            "action": "launch",
+            "provider": "webkit",
+            "executablePath": bin.to_str().unwrap(),
+            "webkitAccount": "ab-test",
+        });
+        let mut state = DaemonState::new();
+        handle_launch(&launch, &mut state).await.unwrap();
+        let pid = state.webdriver_process.as_ref().unwrap().pid().unwrap() as i32;
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let err = handle_launch(&launch, &mut state).await.unwrap_err();
+        assert!(err.contains("webkit WebDriver driver exited"), "{}", err);
+        assert!(
+            !err.contains("\"port\"") && !err.contains("exit status"),
+            "readiness line and status noise must be left out: {}",
+            err
+        );
+        assert!(
+            err.contains("Run `agent-browser close`, then run your command again"),
+            "{}",
+            err
+        );
+        let resp = execute_command(&json!({ "id": "u", "action": "url" }), &mut state).await;
+        assert_eq!(resp["success"], false, "{}", resp);
+        assert_eq!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .matches("launch")
+                .count(),
+            1
+        );
+
+        close_all_browser_backends(&mut state).await.unwrap();
+        let relaunched = handle_launch(&launch, &mut state).await.unwrap();
+        assert!(relaunched.get("reused").is_none(), "{}", relaunched);
+        assert_eq!(handle_url(&state).await.unwrap()["url"], "about:blank");
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_webkit_launch_requires_an_account() {
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("webkit-cli");
+        std::fs::write(&bin, "").unwrap();
+        let mut state = DaemonState::new();
+        let err = handle_launch(
+            &json!({
+                "action": "launch",
+                "provider": "webkit",
+                "executablePath": bin.to_str().unwrap(),
+                "profile": "Default"
+            }),
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("--webkit-account"), "{}", err);
+        assert!(state.webdriver_backend.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_webkit_missing_binary_names_the_install() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_ALLOWED_DOMAINS"]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        let mut state = DaemonState::new();
+        let err = handle_launch(
+            &json!({
+                "action": "launch",
+                "provider": "webkit",
+                "executablePath": "/nonexistent/webkit-cli",
+                "webkitAccount": "a"
+            }),
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("/nonexistent/webkit-cli"), "{}", err);
+        assert!(err.contains("Install webkit-cli"), "{}", err);
     }
 
     #[test]
@@ -17610,7 +18688,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         let guard = EnvGuard::new(&["AGENT_BROWSER_ALLOWED_DOMAINS"]);
         guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
 
-        for provider in ["ios", "safari"] {
+        for provider in ["ios", "safari", "webkit"] {
             let mut state = DaemonState::new();
             let error = handle_launch(
                 &json!({

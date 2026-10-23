@@ -1136,7 +1136,7 @@ fn box_model_center(model: &BoxModel) -> (f64, f64) {
 /// time, so plain text that repeats an anchor label is consumed at its own
 /// position instead of being mistaken for the anchor. Hidden or `javascript:`
 /// anchors stay plain text and the page DOM is never mutated.
-const TEXT_WITH_LINKS_JS: &str = r#"function() {
+pub(crate) const TEXT_WITH_LINKS_JS: &str = r#"function() {
   const text = this.innerText || this.textContent || '';
   const linkable = (a) => {
     if (a.getClientRects().length === 0 || getComputedStyle(a).visibility !== 'visible') return false;

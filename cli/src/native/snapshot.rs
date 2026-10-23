@@ -1491,6 +1491,11 @@ pub(crate) fn dom_snapshot_script(options: &SnapshotOptions) -> String {
         "key": dom_registry_key(),
         "selector": options.selector,
         "urls": options.urls,
+        // With -i the page sends only nodes that can take a ref, decided
+        // with the same role lists assign_refs uses.
+        "interactive": options.interactive,
+        "refRoles": INTERACTIVE_ROLES,
+        "namedRefRoles": CONTENT_ROLES,
     }))
 }
 
@@ -1512,7 +1517,7 @@ fn dom_script(opts: Value) -> String {
 
 /// Window property holding the page-side element registry. Random per daemon
 /// process, so a page cannot pre-plant or anticipate it.
-fn dom_registry_key() -> &'static str {
+pub(crate) fn dom_registry_key() -> &'static str {
     static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     KEY.get_or_init(|| format!("__ab_{}", uuid::Uuid::new_v4().simple()))
 }

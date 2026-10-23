@@ -3656,6 +3656,7 @@ mod tests {
             debug: false,
             headers: None,
             executable_path: None,
+            webkit_account: None,
             extensions: Vec::new(),
             init_scripts: Vec::new(),
             enable: Vec::new(),

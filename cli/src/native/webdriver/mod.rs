@@ -1,8 +1,11 @@
 pub mod appium;
 pub mod backend;
 pub mod client;
+pub mod commands;
 pub mod dom_refs;
 pub mod driver_process;
 pub mod ios;
+pub mod readiness;
 pub mod safari;
 pub mod types;
+pub mod webkit;

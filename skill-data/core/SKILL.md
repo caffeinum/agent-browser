@@ -126,6 +126,7 @@ agent-browser read https://docs.example.com/guide --outline  # compact page head
 agent-browser read https://docs.example.com --llms index --filter auth  # compact llms.txt discovery
 agent-browser get text @e1                # visible text of an element (capped at 50000 chars)
 agent-browser get text body --max-chars 8000 --links  # bounded page text with [text](href) links
+agent-browser -p webkit --webkit-account agent open https://example.com  # macOS system WebKit via webkit-cli; same snapshot/refs
 agent-browser get html @e1                # innerHTML
 agent-browser get attr @e1 href           # any attribute
 agent-browser get value @e1               # input value
@@ -495,6 +496,7 @@ EOF
 --json                  # JSON output (for machine parsing)
 --headed                # show the window (default is headless)
 --engine <name>         # chrome (default), lightpanda, obscura (experimental)
+-p webkit --webkit-account <name>  # macOS system WebKit via webkit-cli (see below)
 --webgpu                # enable WebGPU (software Vulkan on Linux, no GPU needed)
 --auto-connect          # connect to an already-running Chrome
 --cdp <port|url>        # connect to a CDP port or WebSocket URL; root query slash is optional
@@ -511,6 +513,16 @@ EOF
 ```
 
 Engine setup and limits: [Lightpanda](https://agent-browser.dev/engines/lightpanda), [Obscura (experimental)](https://agent-browser.dev/engines/obscura).
+
+## System WebKit (`-p webkit`)
+
+`agent-browser -p webkit --webkit-account <name> <command>` drives macOS system WebKit through webkit-cli 0.5.0+ (`webkit-cli create <name>` first). It keeps one webkit-cli per account across commands; `close` stops it.
+
+- Works: open, back, forward, reload, snapshot, click, fill, type, press, select, check, uncheck, scroll, scrollintoview, focus, wait (ms, selector, --text, --url, --fn, --load load|domcontentloaded), get text, get url, get title, get attr, get html, get value, get count, is visible, is enabled, is checked, eval, screenshot, cookies, read, close. `snapshot -i` output and `@eN` refs use the same format as Chrome.
+- Refused: hover, dblclick, press with modifiers (webkit-cli does not deliver them yet; use eval), and tabs, set viewport, upload, pdf, find, keyboard type, mouse, network, console, errors, trace (no workaround on WebDriver, or eval where it says so).
+- Clicks return at once; the next command waits for the page the click opened. A page that does not load in time fails with `Navigation to <url> did not ... within <n>s`.
+- Input events are synthesized by webkit-cli (`isTrusted` is false). webkit-cli 0.5.0 also leaves a `data-wd` attribute on elements a command looks up: until it is fixed, `get html` can show it and pages can detect it.
+- Rejected options: --proxy, --headers, --user-agent, --state, --extension, --init-script, --enable, --download-path, --args, --color-scheme, --profile, --ca-cert, --allowed-domains.
 
 ## When to load another skill
 

@@ -28,11 +28,9 @@ async fn run_dom_walk(wb: &WebDriverBackend, options: &SnapshotOptions) -> Resul
     wb.execute_function_body(&snapshot::dom_snapshot_script(options), vec![])
         .await
         .map_err(|e| {
+            // Worded without "timeout" so the generic error rewriting keeps it.
             if e.contains("script timeout") {
-                format!(
-                    "Snapshot timed out in the page ({}). Narrow it with `snapshot -s <selector>`.",
-                    e
-                )
+                "Snapshot did not finish within the page's script time limit. Narrow it with `snapshot -s <selector>`.".to_string()
             } else {
                 e
             }
@@ -50,7 +48,14 @@ pub async fn resolve_element(
     ref_map: &RefMap,
     selector_or_ref: &str,
 ) -> Result<String, String> {
-    let Some(ref_id) = parse_ref(selector_or_ref) else {
+    // parse_ref accepts a bare "@e"; a ref needs a number.
+    let Some(ref_id) = parse_ref(selector_or_ref).filter(|id| id.len() > 1) else {
+        if selector_or_ref.trim_start().starts_with('@') {
+            return Err(format!(
+                "Invalid ref '{}': refs look like @e12 and come from the latest `snapshot`",
+                selector_or_ref.trim()
+            ));
+        }
         return wb.find_css(selector_or_ref).await;
     };
     let entry = ref_map
@@ -108,12 +113,23 @@ pub fn element_arg(element_id: &str) -> Value {
     json!({ W3C_ELEMENT_KEY: element_id })
 }
 
-pub async fn element_text(wb: &WebDriverBackend, element_id: &str) -> Result<String, String> {
-    let value = wb
-        .execute_function_body(
-            "var el = arguments[0]; return el.innerText || el.textContent || '';",
-            vec![element_arg(element_id)],
+/// Element text as on CDP: innerText, or with `links` the same
+/// `[text](href)` annotation the CDP path uses.
+pub async fn element_text(
+    wb: &WebDriverBackend,
+    element_id: &str,
+    links: bool,
+) -> Result<String, String> {
+    let body = if links {
+        format!(
+            "return ({}).call(arguments[0]);",
+            crate::native::element::TEXT_WITH_LINKS_JS
         )
+    } else {
+        "var el = arguments[0]; return el.innerText || el.textContent || '';".to_string()
+    };
+    let value = wb
+        .execute_function_body(&body, vec![element_arg(element_id)])
         .await?;
     value
         .as_str()
@@ -281,14 +297,21 @@ mod tests {
         let err = take_snapshot(&backend(port), &SnapshotOptions::default(), &mut refs)
             .await
             .unwrap_err();
-        assert!(err.contains("Snapshot timed out"), "{}", err);
+        assert!(err.contains("Snapshot did not finish"), "{}", err);
+        assert!(
+            !err.to_lowercase().contains("timeout"),
+            "kept intact by error rewriting: {}",
+            err
+        );
         assert!(err.contains("snapshot -s"), "{}", err);
     }
 
     #[tokio::test]
     async fn get_text_rejects_non_string_results() {
         let (port, _server) = fake_driver(vec![json!({ "not": "text" })]).await;
-        let err = element_text(&backend(port), "el-1").await.unwrap_err();
+        let err = element_text(&backend(port), "el-1", false)
+            .await
+            .unwrap_err();
         assert!(err.contains("non-string"), "{}", err);
     }
 
@@ -305,8 +328,51 @@ mod tests {
         assert_eq!(value, json!("Example Domain"));
         let request = &server.await.unwrap()[0];
         let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-        assert_eq!(body["script"], "return (0, eval)(arguments[0]);");
-        assert_eq!(body["args"], json!(["document.title"]));
+        // Compiled into the WebDriver script itself, so page CSP cannot block it.
+        assert_eq!(body["script"], "return (\ndocument.title\n);");
+    }
+
+    /// Several statements are not one expression; they fall back to eval for
+    /// the completion value, and a CSP that blocks eval is named.
+    #[tokio::test]
+    async fn eval_of_statements_uses_eval_and_names_a_blocking_csp() {
+        let syntax =
+            json!({ "error": "javascript error", "message": "SyntaxError: Unexpected token ';'" });
+        let (port, server) =
+            fake_driver_with_status(500, vec![syntax.clone(), syntax.clone()]).await;
+        let err = backend(port)
+            .evaluate_expression("var a = 1; a + 1")
+            .await
+            .unwrap_err();
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let second: Value =
+            serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(second["script"], "return (0, eval)(arguments[0]);");
+        assert_eq!(second["args"], json!(["var a = 1; a + 1"]));
+        assert!(err.contains("SyntaxError"), "{}", err);
+
+        let csp = json!({ "error": "javascript error", "message": "EvalError: Refused to evaluate a string as JavaScript because 'unsafe-eval' is not an allowed source" });
+        let (port, _server) = fake_driver_with_status(500, vec![syntax, csp]).await;
+        let err = backend(port)
+            .evaluate_expression("var a = 1; a")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("Content Security Policy blocks eval"),
+            "{}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_ref_is_an_agent_level_error() {
+        let refs = RefMap::new();
+        for bad in ["@", "@zz", " @e"] {
+            let err = resolve_element(&backend(1), &refs, bad).await.unwrap_err();
+            assert!(err.starts_with("Invalid ref"), "{}: {}", bad, err);
+            assert!(err.contains("@e12"), "{}", err);
+        }
     }
 
     #[tokio::test]

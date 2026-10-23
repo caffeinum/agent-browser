@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use super::driver_process::{DriverProcess, DEFAULT_READY_TIMEOUT};
+use super::driver_process::{DriverProcess, Readiness, DEFAULT_READY_TIMEOUT};
 
 pub fn find_safaridriver() -> Option<PathBuf> {
     let candidates = ["/usr/bin/safaridriver"];
@@ -34,7 +34,7 @@ pub async fn launch_safaridriver(port: u16) -> Result<DriverProcess, String> {
         "safaridriver",
         &driver_path,
         &["--port".to_string(), port.to_string()],
-        port,
+        Readiness::Port(port),
         DEFAULT_READY_TIMEOUT,
     )
     .await

@@ -100,6 +100,7 @@ pub struct Config {
     pub restore_check_fn: Option<String>,
     pub namespace: Option<String>,
     pub executable_path: Option<String>,
+    pub webkit_account: Option<String>,
     pub extensions: Option<Vec<String>>,
     pub init_scripts: Option<Vec<String>>,
     pub enable: Option<Vec<String>>,
@@ -166,6 +167,7 @@ impl Config {
             restore_check_fn: other.restore_check_fn.or(self.restore_check_fn),
             namespace: other.namespace.or(self.namespace),
             executable_path: other.executable_path.or(self.executable_path),
+            webkit_account: other.webkit_account.or(self.webkit_account),
             extensions: match (self.extensions, other.extensions) {
                 (Some(mut a), Some(b)) => {
                     a.extend(b);
@@ -323,6 +325,7 @@ fn extract_config_path(args: &[String]) -> Option<Option<String>> {
         "--namespace",
         "--headers",
         "--executable-path",
+        "--webkit-account",
         "--cdp",
         "--extension",
         "--init-script",
@@ -411,6 +414,9 @@ pub struct Flags {
     pub restore_uses_session: bool,
     pub headers: Option<String>,
     pub executable_path: Option<String>,
+    /// webkit-cli account for `-p webkit`; deliberately separate from the
+    /// Chrome `--profile` so a Chrome profile setting never selects it.
+    pub webkit_account: Option<String>,
     pub cdp: Option<String>,
     pub extensions: Vec<String>,
     pub init_scripts: Vec<String>,
@@ -597,6 +603,10 @@ pub fn parse_flags(args: &[String]) -> Flags {
         executable_path: env::var("AGENT_BROWSER_EXECUTABLE_PATH")
             .ok()
             .or(config.executable_path),
+        webkit_account: env::var("AGENT_BROWSER_WEBKIT_ACCOUNT")
+            .ok()
+            .filter(|a| !a.is_empty())
+            .or(config.webkit_account),
         cdp: env::var("AGENT_BROWSER_CDP").ok().or(config.cdp),
         extensions,
         init_scripts,
@@ -858,6 +868,12 @@ pub fn parse_flags(args: &[String]) -> Flags {
                 if let Some(s) = args.get(i + 1) {
                     flags.executable_path = Some(s.clone());
                     flags.cli_executable_path = true;
+                    i += 1;
+                }
+            }
+            "--webkit-account" => {
+                if let Some(s) = args.get(i + 1) {
+                    flags.webkit_account = Some(s.clone());
                     i += 1;
                 }
             }
@@ -1227,6 +1243,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--namespace",
         "--headers",
         "--executable-path",
+        "--webkit-account",
         "--cdp",
         "--extension",
         "--init-script",
@@ -1549,6 +1566,39 @@ mod tests {
         assert_eq!(flags.restore_check_text.as_deref(), Some("Dashboard"));
         assert_eq!(flags.restore_check_fn.as_deref(), Some("window.ok"));
         assert_eq!(clean_args(&input), vec!["open"]);
+    }
+
+    #[test]
+    fn test_webkit_account_from_config_file() {
+        let config: Config = serde_json::from_str(r#"{ "webkitAccount": "from-config" }"#).unwrap();
+        assert_eq!(config.webkit_account.as_deref(), Some("from-config"));
+        let merged = Config::default().merge(config);
+        assert_eq!(merged.webkit_account.as_deref(), Some("from-config"));
+    }
+
+    #[test]
+    fn test_parse_webkit_account_flag_and_env() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_WEBKIT_ACCOUNT", "AGENT_BROWSER_PROFILE"]);
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        guard.set("AGENT_BROWSER_PROFILE", "Default");
+        let flags = parse_flags(&args("-p webkit --webkit-account agent open example.com"));
+        assert_eq!(flags.webkit_account.as_deref(), Some("agent"));
+        assert_eq!(
+            clean_args(&args("--webkit-account agent open example.com")),
+            args("open example.com")
+        );
+
+        let env_profile_only = parse_flags(&args("-p webkit open example.com"));
+        assert_eq!(
+            env_profile_only.webkit_account, None,
+            "a Chrome profile must not become the webkit account"
+        );
+
+        guard.set("AGENT_BROWSER_WEBKIT_ACCOUNT", "from-env");
+        assert_eq!(
+            parse_flags(&args("open x")).webkit_account.as_deref(),
+            Some("from-env")
+        );
     }
 
     #[test]

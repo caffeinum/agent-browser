@@ -1066,6 +1066,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--allow-file-access` | Allow file:// URLs to access local files (Chromium only) |
 | `--hide-scrollbars <bool>` | Hide native scrollbars in headless Chromium screenshots, enabled by default (or `AGENT_BROWSER_HIDE_SCROLLBARS` env) |
 | `-p, --provider <name>` | Browser provider, including configured `browser.provider` plugins (or `AGENT_BROWSER_PROVIDER` env) |
+| `--webkit-account <name>` | webkit-cli account for `-p webkit`; required, and separate from the Chrome `--profile` (or `AGENT_BROWSER_WEBKIT_ACCOUNT` env) |
 | `--device <name>` | iOS device name, e.g. "iPhone 15 Pro" (or `AGENT_BROWSER_IOS_DEVICE` env) |
 | `--json` | JSON output (for agents) |
 | `--annotate` | Annotated screenshot with numbered element labels (or `AGENT_BROWSER_ANNOTATE` env) |
@@ -1880,6 +1881,32 @@ agent-browser -p ios --device "John's iPhone" open https://example.com
 - Device must be unlocked and connected via USB
 - Slightly slower initial connection than simulator
 - Tests against real Safari performance and behavior
+
+### System WebKit (webkit-cli)
+
+Drive the macOS system WebKit headlessly through [webkit-cli](https://github.com/caffeinum/webkit-cli) 0.5.0 or later (older versions are refused at launch). agent-browser runs `webkit-cli webdriver --account <name>` and uses the WebDriver backend, so `snapshot`, `@ref` selectors, `click`, `fill`, and `get text` work as they do on Chrome.
+
+```bash
+webkit-cli create agent                                   # a dedicated webkit-cli account
+agent-browser -p webkit --webkit-account agent open https://example.com
+agent-browser -p webkit --webkit-account agent snapshot -i
+agent-browser -p webkit --webkit-account agent click @e1
+agent-browser -p webkit --webkit-account agent get text @e2   # capped at 50000 chars like Chrome
+agent-browser close                                       # stops webkit-cli for that account
+```
+
+| Variable | Description |
+| --- | --- |
+| `AGENT_BROWSER_WEBKIT_ACCOUNT` | webkit-cli account (`--webkit-account` takes precedence). Required; there is no default, and a Chrome `--profile` is never used. |
+| `AGENT_BROWSER_WEBKIT_CLI` | Path to webkit-cli (`--executable-path` takes precedence; default: `webkit-cli` on PATH) |
+
+Supported commands: open, back, forward, reload, snapshot, click, fill, type, press, select, check, uncheck, scroll, scrollintoview, focus, wait (ms, selector, --text, --url, --fn, --load load|domcontentloaded), get text, get url, get title, get attr, get html, get value, get count, is visible, is enabled, is checked, eval, screenshot, cookies, read, close. Hover, dblclick and press with modifiers (e.g. Control+a) are refused because webkit-cli does not deliver them yet; tabs, set viewport, upload, pdf, find, keyboard type, mouse, network, console, errors, trace and other CDP tools are refused with an error naming the command and either `workaround: eval` or `no workaround on WebDriver`. Navigations and clicks return once dispatched (WebDriver pageLoadStrategy "none"). `open`, `back`, `forward` and `reload` then wait until the new page is past DOMContentLoaded, and any later command first waits for a navigation the previous command started to commit, so it never reads the old page. That wait is 80% of the command timeout (`AGENT_BROWSER_DEFAULT_TIMEOUT`, 25s by default, or `--timeout`); a page that does not start or finish in time fails with `Navigation to <url> did not start/finish loading within <n>s`. Input from webkit-cli 0.5.0 is synthesized in the page, so events have `isTrusted` set to false. webkit-cli 0.5.0 also leaves a `data-wd` attribute on each element a command looks up; until it is fixed there, `get html` can show `data-wd` attributes and pages can detect them.
+
+Every command with the same account reuses one webkit-cli process and keeps the page. If webkit-cli exits, the next command fails with `webkit WebDriver driver exited`; run `agent-browser close`, then run the command again. `close` ends the session and runs `webkit-cli stop --account <name>`, so cookies are saved and nothing keeps running. Headless webkit sessions are subject to the default idle timeout.
+
+`--proxy`, `--headers`, `--user-agent`, `--state`, `--extension`, `--init-script`, `--enable`, `--download-path`, `--args`, `--color-scheme`, `--profile`, `--ca-cert`, and `--allowed-domains` are rejected with `-p webkit` because WebKit cannot apply them. Tabs, network interception, tracing, and other CDP features are not available.
+
+Measured on 2026-10-22 with webkit-cli 0.4.1 on macOS through `agent-browser -p webkit`: the user agent was `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.2 Safari/605.1.15`, `navigator.webdriver` was `false`, and https://www.techspot.com loaded past its Cloudflare check (title "TechSpot | Tech Enthusiasts, Power Users, Gamers"), where headless Chrome stopped at "Just a moment...". Results on other sites and dates may differ.
 
 ### Browserless
 

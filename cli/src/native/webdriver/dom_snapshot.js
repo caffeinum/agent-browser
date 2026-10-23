@@ -302,9 +302,27 @@ function childNodesOf(node) {
   var kids = node.shadowRoot ? node.shadowRoot.childNodes : node.childNodes;
   return Array.prototype.slice.call(kids);
 }
+// Interactive snapshots render only nodes that can take a ref, so the rest
+// are flattened away here instead of being serialized and sent: for a large
+// page that is most of the payload. The role lists come from the Rust side.
+var interactiveOnly = !!opts.interactive;
+var refRoles = {};
+(opts.refRoles || []).forEach(function (r) { refRoles[r] = 1; });
+var namedRefRoles = {};
+(opts.namedRefRoles || []).forEach(function (r) { namedRefRoles[r] = 1; });
+
+var cursor = [];
+var cursorEls = new Set();
+var cursorInfo = __abCursorScan(function (el, i) { cursor[i] = idOf(el); cursorEls.add(el); });
+
+function canTakeRef(el, role) {
+  return refRoles[role] || namedRefRoles[role] || cursorEls.has(el);
+}
+
 function walkChildren(node, ids) {
   childNodesOf(node).forEach(function (c) {
     if (c.nodeType === 3) {
+      if (interactiveOnly) return;
       var text = c.data.replace(/[\s ]+/g, ' ');
       if (text.trim()) ids.push(push({ role: { type: 'internalRole', value: 'StaticText' }, name: str(text), childIds: [] }).nodeId);
     } else if (c.nodeType === 1) {
@@ -318,7 +336,7 @@ function walkElement(el, ids) {
   if (el.namespaceURI === 'http://www.w3.org/2000/svg') {
     // Inline SVG is a leaf: an image when it carries a name, otherwise decoration.
     var svgName = el.tagName.toLowerCase() === 'svg' ? nameOf(el, 'image') : '';
-    if (svgName) ids.push(push({ role: { type: 'role', value: 'image' }, name: str(svgName), backendDOMNodeId: idOf(el), childIds: [] }).nodeId);
+    if (svgName && (!interactiveOnly || canTakeRef(el, 'image'))) ids.push(push({ role: { type: 'role', value: 'image' }, name: str(svgName), backendDOMNodeId: idOf(el), childIds: [] }).nodeId);
     return;
   }
   var invisible = styleOf(el).visibility !== 'visible';
@@ -326,8 +344,16 @@ function walkElement(el, ids) {
     walkChildren(el, ids);
     return;
   }
-  var node = push({ role: { type: 'role', value: role }, backendDOMNodeId: idOf(el), childIds: [] });
+  if (interactiveOnly && !canTakeRef(el, role)) {
+    walkChildren(el, ids);
+    return;
+  }
   var name = nameOf(el, role);
+  if (interactiveOnly && !refRoles[role] && !cursorEls.has(el) && !name) {
+    walkChildren(el, ids);
+    return;
+  }
+  var node = push({ role: { type: 'role', value: role }, backendDOMNodeId: idOf(el), childIds: [] });
   if (name) node.name = str(name);
   var value = valueOf(el, role);
   if (value) node.value = { type: 'string', value: value };
@@ -349,8 +375,7 @@ if (opts.selector) {
   if (document.body) walkElement(document.body, root.childIds);
 }
 
-var cursor = [];
-var cursorInfo = __abCursorScan(function (el, i) { cursor[i] = idOf(el); });
+
 var cursorOut = [];
 for (var i = 0; i < cursorInfo.length; i++) {
   if (cursor[i] !== undefined) { cursorInfo[i].backendNodeId = cursor[i]; cursorOut.push(cursorInfo[i]); }
