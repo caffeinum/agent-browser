@@ -224,7 +224,7 @@ impl WebDriverClient {
 /// `to_ai_friendly_error` reserves for locator misses. A payload with
 /// neither an error nor an element id is genuinely malformed and keeps the
 /// protocol-shaped message.
-fn element_id_from_value(
+pub(crate) fn element_id_from_value(
     element_value: &Value,
     using: &str,
     value: &str,

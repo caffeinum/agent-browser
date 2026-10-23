@@ -1,6 +1,7 @@
 pub mod appium;
 pub mod backend;
 pub mod client;
+pub mod dom_refs;
 pub mod driver_process;
 pub mod ios;
 pub mod safari;

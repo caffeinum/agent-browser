@@ -902,7 +902,11 @@ async fn find_node_id_by_role_name(
 }
 
 /// Returns the backendDOMNodeId of the only non-ignored node matching role and name.
-fn select_unique_node_id(nodes: &[AXNode], role: &str, name: &str) -> Result<i64, String> {
+pub(crate) fn select_unique_node_id(
+    nodes: &[AXNode],
+    role: &str,
+    name: &str,
+) -> Result<i64, String> {
     let mut found: Option<&AXNode> = None;
 
     for node in nodes {
