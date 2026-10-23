@@ -2883,13 +2883,7 @@ fn parse_get(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     ];
 
     match rest.first().copied() {
-        Some("text") => {
-            let sel = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
-                context: "get text".to_string(),
-                usage: "get text <selector>",
-            })?;
-            Ok(json!({ "id": id, "action": "gettext", "selector": sel }))
-        }
+        Some("text") => parse_get_text(&rest[1..], id),
         Some("html") => {
             let sel = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                 context: "get html".to_string(),
@@ -2948,6 +2942,83 @@ fn parse_get(rest: &[&str], id: &str) -> Result<Value, ParseError> {
             usage: "get <text|html|value|attr|url|title|count|box|styles|cdp-url> [args...]",
         }),
     }
+}
+
+/// Default `get text --max-chars` cap. Keeps one call to roughly 12k tokens so a
+/// `get text body` on a large page cannot flood an agent's context; `--max-chars 0`
+/// restores the full, uncapped text.
+pub const GET_TEXT_DEFAULT_MAX_CHARS: u64 = 50_000;
+
+const GET_TEXT_USAGE: &str = "get text <selector> [--max-chars <n>] [--offset <n>] [--links]";
+
+fn parse_get_text(args: &[&str], id: &str) -> Result<Value, ParseError> {
+    let mut selector: Option<&str> = None;
+    let mut max_chars = GET_TEXT_DEFAULT_MAX_CHARS;
+    let mut offset: u64 = 0;
+    let mut links = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            flag @ ("--max-chars" | "--offset") => {
+                let raw = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("get text {}", flag),
+                        usage: GET_TEXT_USAGE,
+                    })?;
+                let value = raw.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!("{} must be a non-negative integer, got '{}'", flag, raw),
+                    usage: GET_TEXT_USAGE,
+                })?;
+                if flag == "--max-chars" {
+                    max_chars = value;
+                } else {
+                    offset = value;
+                }
+                i += 2;
+            }
+            "--links" => {
+                links = true;
+                i += 1;
+            }
+            other if other.starts_with("--") => {
+                return Err(ParseError::InvalidValue {
+                    message: format!("Unknown flag for get text: {}", other),
+                    usage: GET_TEXT_USAGE,
+                });
+            }
+            other if selector.is_none() => {
+                selector = Some(other);
+                i += 1;
+            }
+            other => {
+                return Err(ParseError::InvalidValue {
+                    message: format!(
+                        "Unexpected argument for get text: '{}'. Quote selectors that contain spaces",
+                        other
+                    ),
+                    usage: GET_TEXT_USAGE,
+                });
+            }
+        }
+    }
+
+    let selector = selector.ok_or_else(|| ParseError::MissingArguments {
+        context: "get text".to_string(),
+        usage: GET_TEXT_USAGE,
+    })?;
+    let mut cmd = json!({ "id": id, "action": "gettext", "selector": selector });
+    if max_chars > 0 {
+        cmd["maxChars"] = json!(max_chars);
+    }
+    if offset > 0 {
+        cmd["offset"] = json!(offset);
+    }
+    if links {
+        cmd["links"] = json!(true);
+    }
+    Ok(cmd)
 }
 
 fn parse_is(rest: &[&str], id: &str) -> Result<Value, ParseError> {
@@ -5551,6 +5622,53 @@ mod tests {
         let err = result.unwrap_err();
         assert!(matches!(err, ParseError::MissingArguments { .. }));
         assert!(err.format().contains("get text"));
+    }
+
+    #[test]
+    fn test_get_text_applies_default_cap() {
+        let cmd = parse_command(&args("get text body"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "gettext");
+        assert_eq!(cmd["selector"], "body");
+        assert_eq!(cmd["maxChars"], GET_TEXT_DEFAULT_MAX_CHARS);
+        assert!(cmd.get("offset").is_none());
+        assert!(cmd.get("links").is_none());
+    }
+
+    #[test]
+    fn test_get_text_window_and_links_flags() {
+        let cmd = parse_command(
+            &args("get text --links body --max-chars 2000 --offset 4000"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["selector"], "body");
+        assert_eq!(cmd["maxChars"], 2000);
+        assert_eq!(cmd["offset"], 4000);
+        assert_eq!(cmd["links"], true);
+    }
+
+    #[test]
+    fn test_get_text_max_chars_zero_disables_cap() {
+        let cmd = parse_command(&args("get text body --max-chars 0"), &default_flags()).unwrap();
+        assert!(cmd.get("maxChars").is_none());
+    }
+
+    #[test]
+    fn test_get_text_rejects_bad_flags() {
+        for input in [
+            "get text body --max-chars",
+            "get text body --max-chars -5",
+            "get text body --offset abc",
+            "get text body --linkz",
+            "get text body extra",
+        ] {
+            let err = parse_command(&args(input), &default_flags()).unwrap_err();
+            assert!(
+                err.format().contains("get text"),
+                "{input}: {}",
+                err.format()
+            );
+        }
     }
 
     // === Protocol alignment tests ===

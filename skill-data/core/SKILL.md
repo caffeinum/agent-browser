@@ -124,7 +124,8 @@ agent-browser read https://docs.example.com/guide  # docs-friendly fetch, prefer
 agent-browser read https://docs.example.com/guide --filter auth  # one matching section
 agent-browser read https://docs.example.com/guide --outline  # compact page headings
 agent-browser read https://docs.example.com --llms index --filter auth  # compact llms.txt discovery
-agent-browser get text @e1                # visible text of an element
+agent-browser get text @e1                # visible text of an element (capped at 50000 chars)
+agent-browser get text body --max-chars 8000 --links  # bounded page text with [text](href) links
 agent-browser get html @e1                # innerHTML
 agent-browser get attr @e1 href           # any attribute
 agent-browser get value @e1               # input value
@@ -296,6 +297,11 @@ agent-browser snapshot -i --json > page.json
 agent-browser snapshot -i
 agent-browser get text @e5
 agent-browser get attr @e10 href
+
+# Long pages: bounded chunks with link URLs inline, no eval needed.
+# A cut ends with "[truncated: ... Run again with --offset N ...]"; follow it to page on.
+agent-browser get text body --max-chars 8000 --links
+agent-browser get text body --max-chars 8000 --links --offset 8000
 
 # Arbitrary shape via JavaScript
 cat <<'EOF' | agent-browser eval --stdin

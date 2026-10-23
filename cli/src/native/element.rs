@@ -1126,12 +1126,69 @@ fn box_model_center(model: &BoxModel) -> (f64, f64) {
     }
 }
 
+/// Rendered text of `this` with each visible `a[href]` rewritten inline as
+/// `[label](absolute-href)`. Rendered text nodes and linkable anchors are walked
+/// in DOM order and aligned against the element's innerText one segment at a
+/// time, so plain text that repeats an anchor label is consumed at its own
+/// position instead of being mistaken for the anchor. Hidden or `javascript:`
+/// anchors stay plain text and the page DOM is never mutated.
+const TEXT_WITH_LINKS_JS: &str = r#"function() {
+  const text = this.innerText || this.textContent || '';
+  const linkable = (a) => {
+    if (a.getClientRects().length === 0 || getComputedStyle(a).visibility !== 'visible') return false;
+    const label = (a.innerText || '').trim();
+    return !!label && !!a.href && !/^javascript:/i.test(a.href);
+  };
+  const rendered = (node) => {
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    if (range.getClientRects().length === 0) return false;
+    const parent = node.parentElement;
+    return !parent || getComputedStyle(parent).visibility === 'visible';
+  };
+  const escape = (word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  let out = '';
+  let cursor = 0;
+  const consume = (raw) => {
+    const words = raw.split(/\s+/).filter(Boolean);
+    if (words.length === 0) return null;
+    const pattern = new RegExp(words.map(escape).join('\\s+'), 'gi');
+    pattern.lastIndex = cursor;
+    const match = pattern.exec(text);
+    if (!match) return null;
+    out += text.slice(cursor, match.index);
+    cursor = match.index + match[0].length;
+    return match[0];
+  };
+  const visit = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const matched = rendered(node) && consume(node.data);
+      if (matched) out += matched;
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    if (node.matches('a[href]') && linkable(node)) {
+      const label = node.innerText.trim();
+      if (consume(label) !== null) {
+        const md = label.replace(/\s+/g, ' ').replace(/([\[\]])/g, '\\$1');
+        const url = node.href.replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/\s/g, '%20');
+        out += '[' + md + '](' + url + ')';
+        return;
+      }
+    }
+    for (const child of node.childNodes) visit(child);
+  };
+  visit(this);
+  return out + text.slice(cursor);
+}"#;
+
 pub async fn get_element_text(
     client: &CdpClient,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
+    links: bool,
 ) -> Result<String, String> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
@@ -1142,12 +1199,16 @@ pub async fn get_element_text(
     )
     .await?;
 
+    let function_declaration = if links {
+        TEXT_WITH_LINKS_JS
+    } else {
+        "function() { return this.innerText || this.textContent || ''; }"
+    };
     let result: EvaluateResult = client
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration:
-                    "function() { return this.innerText || this.textContent || ''; }".to_string(),
+                function_declaration: function_declaration.to_string(),
                 object_id: Some(object_id),
                 arguments: None,
                 return_by_value: Some(true),

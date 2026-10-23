@@ -191,7 +191,9 @@ For sites without WebMCP tools, load the generation and validation workflow with
 ### Get Info
 
 ```bash
-agent-browser get text <sel>          # Get text content
+agent-browser get text <sel>          # Get text content (capped at 50000 chars)
+agent-browser get text <sel> --max-chars <n> --offset <n>  # Page through long text
+agent-browser get text <sel> --links  # Inline links as [text](href)
 agent-browser get html <sel>          # Get innerHTML
 agent-browser get value <sel>         # Get input value
 agent-browser get attr <sel> <attr>   # Get attribute
@@ -202,6 +204,8 @@ agent-browser get count <sel>         # Count matching elements
 agent-browser get box <sel>           # Get bounding box
 agent-browser get styles <sel>        # Get computed styles
 ```
+
+`get text` returns at most 50,000 characters by default, so `get text body` on a long page cannot flood an agent's context. When the text is cut, it ends with a `[truncated: ...]` marker that names how many characters were omitted and the `--offset` that fetches the next part. Use `--max-chars <n>` to pick a different cap, `--max-chars 0` for the full text (the behavior before the cap existed), `--offset <n>` to page through, and `--links` to render visible links inline as `[text](href)` with absolute URLs. With `--json`, the response also carries `totalChars`, `offset`, `truncated`, and `nextOffset`. When the selector matches no element (for example `get text article` on a page without `<article>`), the command fails with an error that names the selector and page; it never falls back to another element.
 
 ### Read Agent-Friendly Text
 

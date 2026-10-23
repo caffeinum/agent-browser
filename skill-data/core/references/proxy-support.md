@@ -126,7 +126,7 @@ for i in "${!URLS[@]}"; do
     export HTTPS_PROXY="${PROXY_LIST[$proxy_index]}"
 
     agent-browser open "${URLS[$i]}"
-    agent-browser get text body > "output-$i.txt"
+    agent-browser get text body --max-chars 0 > "output-$i.txt"
     agent-browser close
 
     sleep 1  # Polite delay

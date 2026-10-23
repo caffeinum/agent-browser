@@ -944,7 +944,18 @@ fn tools() -> Vec<Value> {
             }),
             &[],
         ),
-        tool(TOOL_GET_TEXT, "Get text", "Get visible text from an element.", json!({ "selector": selector_schema() }), &["selector"]),
+        tool(
+            TOOL_GET_TEXT,
+            "Get text",
+            "Get visible text from an element. Output is capped at 50000 chars by default; when cut, the text ends with a [truncated: ...] marker and the response carries totalChars and nextOffset. Page with offset, or pass maxChars 0 for the full text. Set links to render anchors inline as [text](href).",
+            json!({
+                "selector": selector_schema(),
+                "maxChars": { "type": "integer", "minimum": 0, "description": "Maximum characters to return (default 50000). 0 returns the full text." },
+                "offset": { "type": "integer", "minimum": 0, "description": "Character offset to start from, e.g. the nextOffset of a truncated response." },
+                "links": { "type": "boolean", "description": "Render visible links inline as [text](href) with absolute URLs." }
+            }),
+            &["selector"],
+        ),
         tool(TOOL_GET_HTML, "Get HTML", "Get innerHTML from an element.", json!({ "selector": selector_schema() }), &["selector"]),
         tool(TOOL_GET_VALUE, "Get value", "Get an input value.", json!({ "selector": selector_schema() }), &["selector"]),
         tool(TOOL_GET_URL, "Get URL", "Get the current page URL.", json!({}), &[]),
@@ -2298,7 +2309,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_WAIT_FOR_DOWNLOAD => call_wait_download(arguments),
         TOOL_SCREENSHOT => call_screenshot(arguments),
         TOOL_PDF => call_one_string(arguments, "pdf", "path"),
-        TOOL_GET_TEXT => call_get_selector(arguments, "text"),
+        TOOL_GET_TEXT => call_cli_tool(arguments, get_text_command_args(arguments)?, None),
         TOOL_GET_HTML => call_get_selector(arguments, "html"),
         TOOL_GET_VALUE => call_get_selector(arguments, "value"),
         TOOL_GET_ATTR => call_get_attr(arguments),
@@ -2892,6 +2903,21 @@ fn call_get_selector(arguments: &Value, what: &str) -> Result<Value, ProtocolErr
         vec!["get".to_string(), what.to_string(), selector],
         None,
     )
+}
+
+fn get_text_command_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
+    let selector = required_string(arguments, "selector")?;
+    let mut args = vec!["get".to_string(), "text".to_string(), selector];
+    for (field, flag) in [("maxChars", "--max-chars"), ("offset", "--offset")] {
+        if let Some(value) = optional_u64(arguments, field)? {
+            args.push(flag.to_string());
+            args.push(value.to_string());
+        }
+    }
+    if optional_bool(arguments, "links")?.unwrap_or(false) {
+        args.push("--links".to_string());
+    }
+    Ok(args)
 }
 
 fn call_get_attr(arguments: &Value) -> Result<Value, ProtocolError> {
@@ -4246,6 +4272,45 @@ mod tests {
             assert_eq!(command["fps"], 60);
             assert_eq!(command["action"], format!("recording_{operation}"));
         }
+    }
+
+    #[test]
+    fn get_text_options_use_cli_parser() {
+        let cases = [
+            (json!({"selector": "body"}), "get text body"),
+            (
+                json!({"selector": "body", "maxChars": 2000, "offset": 4000, "links": true}),
+                "get text body --max-chars 2000 --offset 4000 --links",
+            ),
+            (
+                json!({"selector": "#main", "maxChars": 0, "links": false}),
+                "get text #main --max-chars 0",
+            ),
+        ];
+        for (arguments, cli) in cases {
+            let mcp_args = get_text_command_args(&arguments).unwrap();
+            let cli_args: Vec<String> = cli.split(' ').map(String::from).collect();
+            assert_eq!(mcp_args, cli_args);
+            let flags = crate::flags::parse_flags(&mcp_args);
+            let mut from_mcp = crate::commands::parse_command(&mcp_args, &flags).unwrap();
+            let mut from_cli = crate::commands::parse_command(&cli_args, &flags).unwrap();
+            from_mcp.as_object_mut().unwrap().remove("id");
+            from_cli.as_object_mut().unwrap().remove("id");
+            assert_eq!(from_mcp, from_cli);
+            assert_eq!(from_mcp["action"], "gettext");
+            assert_eq!(from_mcp["selector"], arguments["selector"]);
+        }
+    }
+
+    #[test]
+    fn get_text_schema_lists_cli_options() {
+        let tools = tools();
+        let tool = tools.iter().find(|t| t["name"] == TOOL_GET_TEXT).unwrap();
+        let props = &tool["inputSchema"]["properties"];
+        for key in ["selector", "maxChars", "offset", "links"] {
+            assert!(props.get(key).is_some(), "missing {key}");
+        }
+        assert!(get_text_command_args(&json!({"selector": "a", "maxChars": -1})).is_err());
     }
 
     #[test]

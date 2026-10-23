@@ -121,9 +121,9 @@ agent-browser --session site3 open https://site3.com &
 wait
 
 # Extract from each
-agent-browser --session site1 get text body > site1.txt
-agent-browser --session site2 get text body > site2.txt
-agent-browser --session site3 get text body > site3.txt
+agent-browser --session site1 get text body --max-chars 0 > site1.txt
+agent-browser --session site2 get text body --max-chars 0 > site2.txt
+agent-browser --session site3 get text body --max-chars 0 > site3.txt
 
 # Cleanup
 agent-browser --session site1 close

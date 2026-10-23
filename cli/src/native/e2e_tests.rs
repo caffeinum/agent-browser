@@ -2925,6 +2925,129 @@ async fn e2e_tab_switch_rejects_bare_integer() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_gettext_links_attribute_each_anchor_to_its_own_position() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let html = concat!(
+        "data:text/html,<html><body><div id='main'>",
+        "<p>See docs first, then <a href='https://example.com/docs'>docs</a>.</p>",
+        "<p><span style='display:none'>home</span>Back home via <a href='https://example.com/1'>home</a>, ",
+        "not home, but <a href='https://example.com/2'>home</a>.</p>",
+        "<pre>code   <a href='https://example.com/pre'>spaced   link</a></pre>",
+        "</div></body></html>"
+    );
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": html }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "gettext", "selector": "#main" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let plain = get_data(&resp)["text"].as_str().unwrap().to_string();
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "gettext", "selector": "#main", "links": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let linked = get_data(&resp)["text"].as_str().unwrap().to_string();
+    assert_eq!(
+        linked,
+        plain
+            .replacen("then docs", "then [docs](https://example.com/docs)", 1)
+            .replacen("via home", "via [home](https://example.com/1)", 1)
+            .replacen("but home", "but [home](https://example.com/2)", 1)
+            .replacen("spaced   link", "[spaced link](https://example.com/pre)", 1),
+        "plain: {plain:?}"
+    );
+    assert!(
+        linked.starts_with("See docs first, then [docs]"),
+        "{linked}"
+    );
+
+    let resp = execute_command(&json!({ "id": "5", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_gettext_window_links_and_missing_selector() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let html = concat!(
+        "data:text/html,<html><body><div id='main'>",
+        "<p>Read <a href='https://example.com/a(1)'>the [docs]</a> or ",
+        "<a href='javascript:void(0)'>noop</a> and ",
+        "<a href='https://example.com/hidden' style='display:none'>ghost</a>",
+        "<a href='https://example.com/b'>docs</a>.</p>",
+        "</div></body></html>"
+    );
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": html }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "gettext", "selector": "#main", "links": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["text"],
+        "Read [the \\[docs\\]](https://example.com/a%281%29) or noop and [docs](https://example.com/b)."
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "gettext", "selector": "#main", "maxChars": 4, "offset": 5 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let data = get_data(&resp);
+    assert!(data["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("the \n\n[truncated: showing chars 5-9 of "));
+    assert_eq!(data["truncated"], true);
+    assert_eq!(data["nextOffset"], 9);
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "gettext", "selector": "article" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+    let error = resp["error"].as_str().unwrap();
+    assert!(error.contains("no element matches 'article'"), "{error}");
+
+    let resp = execute_command(&json!({ "id": "6", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_element_queries() {
     let mut state = DaemonState::new();
 
