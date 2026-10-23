@@ -475,95 +475,20 @@ pub async fn take_snapshot(
         root_indices
     };
 
-    let mut tracker = RoleNameTracker::new();
-    let mut next_ref: usize = ref_map.next_ref_num();
-
-    let mut nodes_with_refs: Vec<(usize, usize)> = Vec::new();
-
     // Pre-collect cursor-interactive elements so we can mark them with refs during tree building
     let cursor_elements: HashMap<i64, CursorElementInfo> =
         find_cursor_interactive_elements(client, session_id)
             .await
             .unwrap_or_default();
 
-    promote_hidden_inputs(&mut tree_nodes, &cursor_elements);
-
-    for (idx, node) in tree_nodes.iter().enumerate() {
-        let role = node.role.as_str();
-        let mut should_ref = if INTERACTIVE_ROLES.contains(&role) {
-            true
-        } else if CONTENT_ROLES.contains(&role) {
-            !node.name.is_empty()
-        } else {
-            false
-        };
-
-        if node
-            .backend_node_id
-            .is_some_and(|bid| cursor_elements.contains_key(&bid))
-        {
-            // ref elements that are cursor-interactive
-            should_ref = true;
-        }
-
-        if should_ref {
-            let nth = tracker.track(role, &node.name, idx);
-            nodes_with_refs.push((idx, nth));
-        }
-    }
-
-    let duplicates = tracker.get_duplicates();
-
-    for (idx, nth) in &nodes_with_refs {
-        let node = &tree_nodes[*idx];
-        let key = format!("{}:{}", node.role, node.name);
-        let actual_nth = if duplicates.contains_key(&key) {
-            Some(*nth)
-        } else {
-            None
-        };
-
-        let ref_id = if let Some(backend_node_id) = tree_nodes[*idx]
-            .backend_node_id
-            .filter(|_| document_is_known)
-        {
-            if let Some(existing) = ref_map.durable_ref(session_id, frame_id, backend_node_id) {
-                existing.to_string()
-            } else {
-                let allocated = format!("e{}", next_ref);
-                next_ref += 1;
-                ref_map.remember_durable_ref(session_id, frame_id, backend_node_id, &allocated);
-                allocated
-            }
-        } else {
-            let allocated = format!("e{}", next_ref);
-            next_ref += 1;
-            allocated
-        };
-
-        ref_map.add_with_frame(
-            ref_id.clone(),
-            tree_nodes[*idx].backend_node_id,
-            &tree_nodes[*idx].role,
-            &tree_nodes[*idx].name,
-            actual_nth,
-            frame_id,
-        );
-
-        tree_nodes[*idx].has_ref = true;
-        tree_nodes[*idx].ref_id = Some(ref_id);
-    }
-
-    // Populate cursor_info for ref-bearing nodes
-    for (idx, _) in &nodes_with_refs {
-        if let Some(bid) = tree_nodes[*idx].backend_node_id {
-            if let Some(cursor_info) = cursor_elements.get(&bid) {
-                tree_nodes[*idx].cursor_info = Some((*cursor_info).clone());
-            }
-        }
-    }
-
-    ref_map.set_next_ref_num(next_ref);
+    assign_refs(
+        &mut tree_nodes,
+        &cursor_elements,
+        ref_map,
+        session_id,
+        frame_id,
+        document_is_known,
+    );
 
     if options.urls {
         let link_nodes: Vec<(usize, i64)> = tree_nodes
@@ -708,20 +633,102 @@ pub async fn take_snapshot(
         }
     }
 
-    if options.compact {
-        output = compact_tree(&output, options.interactive);
-    }
+    Ok(finish_output(output, options))
+}
 
-    let trimmed = output.trim().to_string();
+/// Allocate refs for interactive, named content, and cursor-interactive nodes,
+/// reusing durable refs for nodes already seen in the same document.
+fn assign_refs(
+    tree_nodes: &mut [TreeNode],
+    cursor_elements: &HashMap<i64, CursorElementInfo>,
+    ref_map: &mut RefMap,
+    session_id: &str,
+    frame_id: Option<&str>,
+    document_is_known: bool,
+) {
+    promote_hidden_inputs(tree_nodes, cursor_elements);
 
-    if trimmed.is_empty() {
-        if options.interactive {
-            return Ok("(no interactive elements)".to_string());
+    let mut tracker = RoleNameTracker::new();
+    let mut next_ref: usize = ref_map.next_ref_num();
+
+    let mut nodes_with_refs: Vec<(usize, usize)> = Vec::new();
+
+    for (idx, node) in tree_nodes.iter().enumerate() {
+        let role = node.role.as_str();
+        let mut should_ref = if INTERACTIVE_ROLES.contains(&role) {
+            true
+        } else if CONTENT_ROLES.contains(&role) {
+            !node.name.is_empty()
+        } else {
+            false
+        };
+
+        if node
+            .backend_node_id
+            .is_some_and(|bid| cursor_elements.contains_key(&bid))
+        {
+            // ref elements that are cursor-interactive
+            should_ref = true;
         }
-        return Ok("(empty page)".to_string());
+
+        if should_ref {
+            let nth = tracker.track(role, &node.name, idx);
+            nodes_with_refs.push((idx, nth));
+        }
     }
 
-    Ok(trimmed)
+    let duplicates = tracker.get_duplicates();
+
+    for (idx, nth) in &nodes_with_refs {
+        let node = &tree_nodes[*idx];
+        let key = format!("{}:{}", node.role, node.name);
+        let actual_nth = if duplicates.contains_key(&key) {
+            Some(*nth)
+        } else {
+            None
+        };
+
+        let ref_id = if let Some(backend_node_id) = tree_nodes[*idx]
+            .backend_node_id
+            .filter(|_| document_is_known)
+        {
+            if let Some(existing) = ref_map.durable_ref(session_id, frame_id, backend_node_id) {
+                existing.to_string()
+            } else {
+                let allocated = format!("e{}", next_ref);
+                next_ref += 1;
+                ref_map.remember_durable_ref(session_id, frame_id, backend_node_id, &allocated);
+                allocated
+            }
+        } else {
+            let allocated = format!("e{}", next_ref);
+            next_ref += 1;
+            allocated
+        };
+
+        ref_map.add_with_frame(
+            ref_id.clone(),
+            tree_nodes[*idx].backend_node_id,
+            &tree_nodes[*idx].role,
+            &tree_nodes[*idx].name,
+            actual_nth,
+            frame_id,
+        );
+
+        tree_nodes[*idx].has_ref = true;
+        tree_nodes[*idx].ref_id = Some(ref_id);
+    }
+
+    // Populate cursor_info for ref-bearing nodes
+    for (idx, _) in &nodes_with_refs {
+        if let Some(bid) = tree_nodes[*idx].backend_node_id {
+            if let Some(cursor_info) = cursor_elements.get(&bid) {
+                tree_nodes[*idx].cursor_info = Some((*cursor_info).clone());
+            }
+        }
+    }
+
+    ref_map.set_next_ref_num(next_ref);
 }
 
 /// Resolve the child frame ID for an iframe element given its backendNodeId.
@@ -769,21 +776,16 @@ async fn resolve_iframe_frame_id(
         .ok_or_else(|| "Could not resolve iframe frame ID".to_string())
 }
 
-async fn find_cursor_interactive_elements(
-    client: &CdpClient,
-    session_id: &str,
-) -> Result<HashMap<i64, CursorElementInfo>, String> {
-    // Single JS evaluation that matches the v0.19.0 Node.js findCursorInteractiveElements():
-    // - Uses querySelectorAll('*') to walk all elements
-    // - Checks getComputedStyle(el).cursor === 'pointer'
-    // - Checks onclick attribute/handler and tabindex
-    // - Skips interactiveTags (a, button, input, select, textarea, details, summary)
-    // - Skips elements with interactive ARIA roles
-    // - Deduplicates inherited cursor:pointer from parent
-    // - Skips empty text and zero-size elements
-    // - Tags each matched element with data-__ab-ci for batch backendNodeId resolution
-    let js = r#"
-(function() {
+/// Single JS evaluation that matches the v0.19.0 Node.js findCursorInteractiveElements():
+/// - Uses querySelectorAll('*') to walk all elements
+/// - Checks getComputedStyle(el).cursor === 'pointer'
+/// - Checks onclick attribute/handler and tabindex
+/// - Skips interactiveTags (a, button, input, select, textarea, details, summary)
+/// - Skips elements with interactive ARIA roles
+/// - Deduplicates inherited cursor:pointer from parent
+/// - Skips empty text and zero-size elements
+/// - Calls `mark(el, index)` for each match so callers can map results back to nodes
+pub(crate) const CURSOR_SCAN_FN: &str = r#"function(mark) {
     var results = [];
     if (!document.body) return results;
 
@@ -846,7 +848,7 @@ async fn find_cursor_interactive_elements(
             }
         }
 
-        el.setAttribute('data-__ab-ci', String(results.length));
+        mark(el, results.length);
         results.push({
             text: text,
             tagName: tagName,
@@ -859,14 +861,22 @@ async fn find_cursor_interactive_elements(
         });
     }
     return results;
-})()
-"#;
+}"#;
+
+async fn find_cursor_interactive_elements(
+    client: &CdpClient,
+    session_id: &str,
+) -> Result<HashMap<i64, CursorElementInfo>, String> {
+    let js = format!(
+        "({})(function(el, i) {{ el.setAttribute('data-__ab-ci', String(i)); }})",
+        CURSOR_SCAN_FN
+    );
 
     let result: EvaluateResult = client
         .send_command_typed(
             "Runtime.evaluate",
             &EvaluateParams {
-                expression: js.to_string(),
+                expression: js,
                 return_by_value: Some(true),
                 await_promise: Some(false),
             },
@@ -975,83 +985,65 @@ async fn find_cursor_interactive_elements(
         eprintln!("[agent-browser] Warning: failed to clean up data-__ab-ci attributes: {e}");
     }
 
-    // Build the map
-    let mut map: HashMap<i64, CursorElementInfo> = HashMap::new();
-    for (i, elem) in elements.iter().enumerate() {
-        let backend_node_id = idx_to_backend.get(&i).copied();
-
-        // Role differentiation: v0.19.0 uses 'clickable' for cursor:pointer or onclick,
-        // 'focusable' for tabindex-only elements.
-        let has_cursor_pointer = elem
-            .get("hasCursorPointer")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let has_on_click = elem
-            .get("hasOnClick")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let has_tab_index = elem
-            .get("hasTabIndex")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let is_editable = elem
-            .get("isEditable")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let kind = if has_cursor_pointer || has_on_click {
-            "clickable"
-        } else if is_editable {
-            "editable"
-        } else {
-            "focusable"
-        };
-
-        let mut hints: Vec<String> = Vec::new();
-        if has_cursor_pointer {
-            hints.push("cursor:pointer".to_string());
-        }
-        if has_on_click {
-            hints.push("onclick".to_string());
-        }
-        if has_tab_index {
-            hints.push("tabindex".to_string());
-        }
-        if is_editable {
-            hints.push("contenteditable".to_string());
-        }
-
-        let text = elem
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-
-        let hidden_input_kind = elem
-            .get("hiddenInputType")
-            .and_then(|v| v.as_str())
-            .and_then(HiddenInputKind::parse);
-        let hidden_input_checked = elem
-            .get("hiddenInputChecked")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        if let Some(bid) = backend_node_id {
-            map.insert(
-                bid,
-                CursorElementInfo {
-                    kind: kind.to_string(),
-                    hints,
-                    text,
-                    hidden_input_kind,
-                    hidden_input_checked,
-                },
-            );
-        }
-    }
+    let map = elements
+        .iter()
+        .enumerate()
+        .filter_map(|(i, elem)| {
+            idx_to_backend
+                .get(&i)
+                .map(|&bid| (bid, cursor_info_from_json(elem)))
+        })
+        .collect();
 
     Ok(map)
+}
+
+fn cursor_info_from_json(elem: &Value) -> CursorElementInfo {
+    let flag = |key: &str| elem.get(key).and_then(Value::as_bool).unwrap_or(false);
+    let has_cursor_pointer = flag("hasCursorPointer");
+    let has_on_click = flag("hasOnClick");
+    let has_tab_index = flag("hasTabIndex");
+    let is_editable = flag("isEditable");
+
+    // v0.19.0 uses 'clickable' for cursor:pointer or onclick, 'focusable' for
+    // tabindex-only elements.
+    let kind = if has_cursor_pointer || has_on_click {
+        "clickable"
+    } else if is_editable {
+        "editable"
+    } else {
+        "focusable"
+    };
+
+    let hints = [
+        (has_cursor_pointer, "cursor:pointer"),
+        (has_on_click, "onclick"),
+        (has_tab_index, "tabindex"),
+        (is_editable, "contenteditable"),
+    ]
+    .iter()
+    .filter(|(on, _)| *on)
+    .map(|(_, hint)| hint.to_string())
+    .collect();
+
+    CursorElementInfo {
+        kind: kind.to_string(),
+        hints,
+        text: elem
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        hidden_input_kind: elem
+            .get("hiddenInputType")
+            .and_then(Value::as_str)
+            .and_then(HiddenInputKind::parse),
+        hidden_input_checked: elem
+            .get("hiddenInputChecked")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
 }
 
 /// Promote LabelText/generic nodes that wrap a hidden radio/checkbox input.
@@ -1352,6 +1344,22 @@ fn render_tree(
     }
 }
 
+fn finish_output(mut output: String, options: &SnapshotOptions) -> String {
+    if options.compact {
+        output = compact_tree(&output, options.interactive);
+    }
+
+    let trimmed = output.trim().to_string();
+    if trimmed.is_empty() {
+        return if options.interactive {
+            "(no interactive elements)".to_string()
+        } else {
+            "(empty page)".to_string()
+        };
+    }
+    trimmed
+}
+
 fn compact_tree(tree: &str, interactive: bool) -> String {
     let lines: Vec<&str> = tree.lines().collect();
     if lines.is_empty() {
@@ -1467,6 +1475,101 @@ fn extract_properties(props: &Option<Vec<AXProperty>>) -> NodeProperties {
     }
 
     (level, checked, expanded, selected, disabled, required)
+}
+
+/// Page-side DOM walk for backends without a CDP accessibility tree
+/// (WebDriver). It emits CDP-shaped AX nodes so the output goes through the
+/// same `build_tree`, `assign_refs`, and `render_tree` as the CDP path.
+const DOM_SNAPSHOT_JS: &str = include_str!("webdriver/dom_snapshot.js");
+
+/// RefMap document scope for DOM-walk snapshots; ids are per-document salted.
+pub(crate) const DOM_SNAPSHOT_SCOPE: &str = "dom-walk";
+
+/// Function body (WebDriver execute/sync shape) that returns the DOM walk.
+pub(crate) fn dom_snapshot_script(options: &SnapshotOptions) -> String {
+    dom_script(serde_json::json!({
+        "key": dom_registry_key(),
+        "selector": options.selector,
+        "urls": options.urls,
+    }))
+}
+
+/// Function body returning the element behind a DOM-walk ref: the element,
+/// null when it is gone, or a string saying why it no longer matches.
+pub(crate) fn dom_resolve_script(id: i64, role: &str, name: &str) -> String {
+    dom_script(serde_json::json!({
+        "key": dom_registry_key(),
+        "resolve": { "id": id, "role": role, "name": name },
+    }))
+}
+
+fn dom_script(opts: Value) -> String {
+    format!(
+        "var __abCursorScan = {};\nvar __abOpts = {};\n{}",
+        CURSOR_SCAN_FN, opts, DOM_SNAPSHOT_JS
+    )
+}
+
+/// Window property holding the page-side element registry. Random per daemon
+/// process, so a page cannot pre-plant or anticipate it.
+fn dom_registry_key() -> &'static str {
+    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| format!("__ab_{}", uuid::Uuid::new_v4().simple()))
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct DomSnapshot {
+    document: String,
+    pub(crate) nodes: Vec<AXNode>,
+    cursor: Vec<Value>,
+    hrefs: HashMap<String, String>,
+}
+
+pub(crate) fn parse_dom_snapshot(result: Value) -> Result<DomSnapshot, String> {
+    serde_json::from_value(result).map_err(|e| format!("Invalid DOM snapshot result: {}", e))
+}
+
+/// Render a DOM-walk result exactly like a CDP snapshot and record its refs.
+pub(crate) fn render_dom_snapshot(
+    snapshot: DomSnapshot,
+    options: &SnapshotOptions,
+    ref_map: &mut RefMap,
+) -> String {
+    let document_is_known = ref_map.observe_document(
+        DOM_SNAPSHOT_SCOPE,
+        None,
+        DOM_SNAPSHOT_SCOPE,
+        Some(&snapshot.document),
+    );
+    let (mut tree_nodes, roots) = build_tree(&snapshot.nodes);
+    let cursor_elements: HashMap<i64, CursorElementInfo> = snapshot
+        .cursor
+        .iter()
+        .filter_map(|e| Some((e.get("backendNodeId")?.as_i64()?, cursor_info_from_json(e))))
+        .collect();
+    assign_refs(
+        &mut tree_nodes,
+        &cursor_elements,
+        ref_map,
+        DOM_SNAPSHOT_SCOPE,
+        None,
+        document_is_known,
+    );
+    if options.urls {
+        for node in tree_nodes
+            .iter_mut()
+            .filter(|n| n.role == "link" && n.has_ref)
+        {
+            node.url = node
+                .backend_node_id
+                .and_then(|bid| snapshot.hrefs.get(&bid.to_string()).cloned());
+        }
+    }
+    let mut output = String::new();
+    for &root in &roots {
+        render_tree(&tree_nodes, root, 0, &mut output, options);
+    }
+    finish_output(output, options)
 }
 
 /// Build the set of texts to de-duplicate cursor-interactive elements against.

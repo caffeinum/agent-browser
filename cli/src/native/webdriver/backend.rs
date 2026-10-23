@@ -49,6 +49,56 @@ impl WebDriverBackend {
     pub fn new(client: super::client::WebDriverClient) -> Self {
         Self { client }
     }
+
+    /// Evaluate `expression` like CDP Runtime.evaluate: the value of the last
+    /// expression statement, with promises awaited. WebDriver's execute/sync
+    /// runs a function body, so without this a bare expression returns null.
+    /// A function-body script such as `return document.title` is therefore a
+    /// SyntaxError here, exactly as it is on the CDP path.
+    pub async fn evaluate_expression(&self, expression: &str) -> Result<Value, String> {
+        self.client
+            .execute_script(
+                "return (0, eval)(arguments[0]);",
+                vec![Value::String(expression.to_string())],
+            )
+            .await
+    }
+
+    /// Run a function body (`arguments` available, `return` for the result).
+    pub async fn execute_function_body(
+        &self,
+        body: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, String> {
+        self.client.execute_script(body, args).await
+    }
+
+    /// Resolve a WebDriver element reference returned by a function body;
+    /// `None` when the body returned null.
+    pub async fn element_from_script(
+        &self,
+        body: &str,
+        args: Vec<Value>,
+    ) -> Result<Option<String>, String> {
+        let value = self.client.execute_script(body, args).await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        super::client::element_id_from_value(&value, "script", body).map(Some)
+    }
+
+    pub async fn find_css(&self, selector: &str) -> Result<String, String> {
+        self.client.find_element("css selector", selector).await
+    }
+
+    pub async fn click_element(&self, element_id: &str) -> Result<(), String> {
+        self.client.click_element(element_id).await
+    }
+
+    pub async fn fill_element(&self, element_id: &str, value: &str) -> Result<(), String> {
+        self.client.clear_element(element_id).await?;
+        self.client.send_keys(element_id, value).await
+    }
 }
 
 #[async_trait]

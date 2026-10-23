@@ -1835,6 +1835,8 @@ agent-browser open https://example.com
 
 **Note:** The iOS provider boots the simulator, starts Appium, and controls Safari. First launch takes ~30-60 seconds; subsequent commands are fast.
 
+**WebDriver sessions (iOS and Safari):** `snapshot` (including `-i`, `-c`, `-d`, `-s`, and `--urls`), `click`, `fill`, and `get text` work with `@ref` or CSS selectors. Snapshots are computed in the page from the DOM with the same format and refs as CDP snapshots; accessible names approximate Chrome's, and iframe contents are not expanded. A ref is re-checked against its snapshot role and name before use, and a stale ref recovers only when its role and name were unique. `eval` evaluates an expression and returns its value, as on Chrome (`eval "document.title"`, not `eval "return document.title"`).
+
 #### Real Device Support
 
 Appium also supports real iOS devices connected via USB. This requires additional one-time setup:

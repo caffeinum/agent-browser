@@ -29,6 +29,33 @@ if os.environ.get("FAKE_WD_LOG"):
         log.write("launch %s\n" % account)
 
 
+ELEMENT = {"element-6066-11e4-a52e-4f735466cecf": "el-7"}
+SNAPSHOT = {
+    "document": "fake-doc",
+    "nodes": [
+        {"nodeId": "0", "role": {"type": "role", "value": "RootWebArea"}, "childIds": ["1"]},
+        {
+            "nodeId": "1",
+            "role": {"type": "role", "value": "button"},
+            "name": {"type": "computedString", "value": "Save"},
+            "backendDOMNodeId": 7,
+            "childIds": [],
+        },
+    ],
+    "cursor": [],
+    "hrefs": {},
+}
+
+
+def execute(script):
+    """Canned answers for agent-browser's DOM-walk scripts (no JS engine here)."""
+    if "__abOpts" in script:
+        return ELEMENT if '"resolve"' in script else SNAPSHOT
+    if "innerText" in script:
+        return "Save (clicked %d)" % state.get("clicks", 0)
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -55,6 +82,11 @@ class Handler(BaseHTTPRequestHandler):
         sid = state.get("sid")
         if self.path == "/session/%s/url" % sid:
             state["url"] = data["url"]
+            return self.reply(None)
+        if self.path == "/session/%s/execute/sync" % sid:
+            return self.reply(execute(data["script"]))
+        if self.path == "/session/%s/element/el-7/click" % sid:
+            state["clicks"] = state.get("clicks", 0) + 1
             return self.reply(None)
         return self.reply({"error": "unknown command", "message": self.path}, 404)
 

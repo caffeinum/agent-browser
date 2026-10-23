@@ -5898,7 +5898,7 @@ async fn handle_evaluate(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
                 .get("script")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'script' parameter")?;
-            let result = wb.evaluate(script).await?;
+            let result = wb.evaluate_expression(script).await?;
             let url = wb.get_url().await.unwrap_or_default();
             return Ok(json!({ "result": result, "origin": url }));
         }
@@ -5960,9 +5960,6 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
 // ---------------------------------------------------------------------------
 
 async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
-
     let options = SnapshotOptions {
         selector: cmd
             .get("selector")
@@ -5984,18 +5981,31 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     };
 
     let previous_refs = state.ref_map.ref_ids();
-    state.ref_map.begin_snapshot();
-    let tree = snapshot::take_snapshot(
-        &mgr.client,
-        &session_id,
-        &options,
-        &mut state.ref_map,
-        state.active_frame_id.as_deref(),
-        &state.iframe_sessions,
-    )
-    .await?;
-
-    let url = mgr.get_url().await.unwrap_or_default();
+    let (tree, url, session_id) = match (&state.browser, &state.webdriver_backend) {
+        (None, Some(wb)) => {
+            state.ref_map.begin_snapshot();
+            let tree =
+                super::webdriver::dom_refs::take_snapshot(wb, &options, &mut state.ref_map).await?;
+            let url = wb.get_url().await.unwrap_or_default();
+            (tree, url, snapshot::DOM_SNAPSHOT_SCOPE.to_string())
+        }
+        (mgr, _) => {
+            let mgr = mgr.as_ref().ok_or("Browser not launched")?;
+            let session_id = mgr.active_session_id()?.to_string();
+            state.ref_map.begin_snapshot();
+            let tree = snapshot::take_snapshot(
+                &mgr.client,
+                &session_id,
+                &options,
+                &mut state.ref_map,
+                state.active_frame_id.as_deref(),
+                &state.iframe_sessions,
+            )
+            .await?;
+            let url = mgr.get_url().await.unwrap_or_default();
+            (tree, url, session_id)
+        }
+    };
 
     let refs: serde_json::Map<String, Value> = state
         .ref_map
@@ -6410,7 +6420,9 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
-            wb.click(selector).await?;
+            let element =
+                super::webdriver::dom_refs::resolve_element(wb, &state.ref_map, selector).await?;
+            wb.click_element(&element).await?;
             return Ok(json!({ "clicked": selector }));
         }
     }
@@ -6595,7 +6607,9 @@ async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
 
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
-            wb.fill(selector, value).await?;
+            let element =
+                super::webdriver::dom_refs::resolve_element(wb, &state.ref_map, selector).await?;
+            wb.fill_element(&element, value).await?;
             return Ok(json!({ "filled": selector }));
         }
     }
@@ -6902,12 +6916,19 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
 }
 
 async fn handle_gettext(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
+    if let (None, Some(wb)) = (&state.browser, &state.webdriver_backend) {
+        let element =
+            super::webdriver::dom_refs::resolve_element(wb, &state.ref_map, selector).await?;
+        let text = super::webdriver::dom_refs::element_text(wb, &element).await?;
+        let url = wb.get_url().await.unwrap_or_default();
+        return Ok(json!({ "text": text, "origin": url }));
+    }
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
 
     let max_chars = optional_usize(cmd, "maxChars")?;
     let offset = optional_usize(cmd, "offset")?.unwrap_or(0);
@@ -15788,6 +15809,59 @@ mod tests {
             handle_url(&state).await.unwrap()["url"],
             "https://example.com/kept"
         );
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    /// snapshot -> click @ref -> get text @ref through the daemon over a fake
+    /// WebDriver server that answers the DOM-walk scripts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_webdriver_snapshot_click_and_get_text_by_ref() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("launches.log");
+        let mut state = DaemonState::new();
+        launch_local_webdriver(&mut state, fake_local_spec("safari"), || {
+            spawn_fake_local_driver(&log)
+        })
+        .await
+        .unwrap();
+
+        let snap = execute_command(
+            &json!({ "id": "s", "action": "snapshot", "interactive": true }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(snap["success"], true, "{}", snap);
+        let tree = snap["data"]["snapshot"].as_str().unwrap();
+        assert!(tree.starts_with("- button \"Save\" [ref=e"), "{}", tree);
+        let ref_id = tree
+            .split("ref=")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(']')
+            .to_string();
+
+        let click = execute_command(
+            &json!({ "id": "c", "action": "click", "selector": format!("@{}", ref_id) }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(click["success"], true, "{}", click);
+
+        let text = execute_command(
+            &json!({ "id": "t", "action": "gettext", "selector": format!("@{}", ref_id) }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(text["success"], true, "{}", text);
+        assert_eq!(text["data"]["text"], "Save (clicked 1)");
         close_all_browser_backends(&mut state).await.unwrap();
     }
 
