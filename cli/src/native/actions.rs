@@ -5378,6 +5378,13 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
     let local_webdriver_launch = provider_name
         .is_some_and(|p| matches!(p.to_ascii_lowercase().as_str(), "safari" | "webkit"));
     if !local_webdriver_launch {
+        // Launching Chrome (or attaching to CDP) replaces a WebDriver session;
+        // stop its driver instead of leaving it running unused.
+        if state.webdriver_backend.is_some()
+            && !provider_name.is_some_and(|p| p.eq_ignore_ascii_case("ios"))
+        {
+            close_webdriver_backends(state).await?;
+        }
         state.ref_map.invalidate_all_documents();
         state.session_setup = SessionSetup::default();
     }
@@ -5750,6 +5757,7 @@ where
             "backend": "webdriver",
         }));
     }
+    let replaced = state.webdriver_identity.clone();
     close_webdriver_backends(state).await?;
     state.ref_map.invalidate_all_documents();
     state.session_setup = SessionSetup::default();
@@ -5777,12 +5785,28 @@ where
     write_extensions_file(&state.session_id);
     state.reset_input_state();
 
-    Ok(json!({
+    let mut result = json!({
         "launched": true,
         "provider": spec.provider,
         "port": port,
         "backend": "webdriver",
-    }))
+    });
+    if let Some(previous) = replaced {
+        result["notice"] = json!(format!(
+            "Closed the previous {} session ({}) to start {}; its page and refs are gone",
+            spec.provider,
+            describe_webdriver_identity(&previous),
+            describe_webdriver_identity(state.webdriver_identity.as_deref().unwrap_or(""))
+        ));
+    }
+    Ok(result)
+}
+
+fn describe_webdriver_identity(identity: &str) -> String {
+    match identity.strip_prefix(WEBKIT_IDENTITY_PREFIX) {
+        Some(account) => format!("webkit-cli account {}", account),
+        None => identity.to_string(),
+    }
 }
 
 async fn check_local_webdriver_alive(
@@ -16905,6 +16929,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             .await
             .unwrap();
         assert!(other.get("reused").is_none(), "{}", other);
+        assert_eq!(other["notice"], "Closed the previous webkit session (webkit-cli account ab-test) to start webkit-cli account ab-other; its page and refs are gone");
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             "launch ab-test\nstop ab-test\nlaunch ab-other\n"
@@ -17274,6 +17299,11 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
         let err = handle_launch(&launch, &mut state).await.unwrap_err();
         assert!(err.contains("webkit WebDriver driver exited"), "{}", err);
+        assert!(
+            !err.contains("\"port\"") && !err.contains("exit status"),
+            "readiness line and status noise must be left out: {}",
+            err
+        );
         assert!(
             err.contains("Run `agent-browser close`, then run your command again"),
             "{}",

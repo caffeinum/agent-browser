@@ -243,15 +243,28 @@ fn webdriver_provider_option_error(flags: &Flags) -> Option<String> {
         ("--profile", flags.profile.is_some() && provider == "webkit"),
     ];
     let (flag, _) = unsupported.iter().find(|(_, set)| *set)?;
-    let hint = if *flag == "--profile" {
-        " (use --webkit-account to pick a webkit-cli account)"
-    } else {
-        ""
-    };
+    if *flag == "--profile" {
+        return Some(format!(
+            "--profile is not supported with -p {} (set by {}); use --webkit-account to pick a webkit-cli account",
+            provider,
+            profile_source(flags)
+        ));
+    }
     Some(format!(
-        "{} is not supported with -p {} (set by flag, env, or config){}",
-        flag, provider, hint
+        "{} is not supported with -p {} (set by flag, env, or config)",
+        flag, provider
     ))
+}
+
+/// Where the Chrome profile setting came from, so its refusal says what to unset.
+fn profile_source(flags: &Flags) -> &'static str {
+    if flags.cli_profile {
+        "the --profile flag"
+    } else if std::env::var("AGENT_BROWSER_PROFILE").is_ok() {
+        "AGENT_BROWSER_PROFILE"
+    } else {
+        "the config file's \"profile\" key"
+    }
 }
 
 fn restore_key_from_flags(flags: &Flags) -> Option<&str> {
@@ -2048,7 +2061,17 @@ fn main() {
         let launch_cmd = build_provider_launch_command(provider, &flags);
 
         let err = match send_command(launch_cmd, &flags.session) {
-            Ok(resp) if resp.success => None,
+            Ok(resp) if resp.success => {
+                if let Some(notice) = resp
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("notice"))
+                    .and_then(|n| n.as_str())
+                {
+                    eprintln!("{} {}", color::warning_indicator(), notice);
+                }
+                None
+            }
             Ok(resp) => Some((
                 resp.error
                     .unwrap_or_else(|| "Provider connection failed".to_string()),
@@ -2789,6 +2812,25 @@ mod tests {
                 err
             );
         }
+        let mut from_flag = base();
+        from_flag.profile = Some("Default".into());
+        from_flag.cli_profile = true;
+        assert!(webdriver_provider_option_error(&from_flag)
+            .unwrap()
+            .contains("(set by the --profile flag); use --webkit-account"));
+        let mut from_config = base();
+        from_config.profile = Some("Default".into());
+        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_PROFILE"]);
+        guard.remove("AGENT_BROWSER_PROFILE");
+        assert!(webdriver_provider_option_error(&from_config)
+            .unwrap()
+            .contains("config file's \"profile\" key"));
+        guard.set("AGENT_BROWSER_PROFILE", "Default");
+        assert!(webdriver_provider_option_error(&from_config)
+            .unwrap()
+            .contains("(set by AGENT_BROWSER_PROFILE)"));
+        drop(guard);
+
         let mut safari = neutral_launch_config_flags();
         safari.provider = Some("safari".to_string());
         safari.proxy = Some("http://p".into());

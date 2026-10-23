@@ -209,11 +209,37 @@ impl DriverProcess {
     /// say why the session is gone instead of failing with a connection error.
     pub fn exit_report(&mut self) -> Option<String> {
         let status = self.child.as_mut()?.try_wait().ok()??;
+        let how = match status.code() {
+            Some(0) => String::new(),
+            Some(code) => format!(" with code {}", code),
+            None => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    status
+                        .signal()
+                        .map(|s| format!(" on signal {}", s))
+                        .unwrap_or_default()
+                }
+                #[cfg(not(unix))]
+                String::new()
+            }
+        };
+        // The readiness announcement is not a diagnostic; leave it out.
+        let output: Vec<String> = self
+            .output()
+            .lines()
+            .filter(|line| announced_port(line).is_none() && !line.trim().is_empty())
+            .map(str::to_string)
+            .collect();
+        let detail = if output.is_empty() {
+            String::new()
+        } else {
+            format!(". Driver output:\n{}", output.join("\n"))
+        };
         Some(format!(
-            "{} WebDriver driver exited ({}){}",
-            self.name,
-            status,
-            self.output_suffix()
+            "{} WebDriver driver exited{}{}",
+            self.name, how, detail
         ))
     }
 
