@@ -1127,28 +1127,58 @@ fn box_model_center(model: &BoxModel) -> (f64, f64) {
 }
 
 /// Rendered text of `this` with each visible `a[href]` rewritten inline as
-/// `[label](absolute-href)`. Anchors are matched against the element's innerText
-/// in document order, so hidden or `javascript:` anchors stay plain text and the
-/// page DOM is never mutated.
+/// `[label](absolute-href)`. Rendered text nodes and linkable anchors are walked
+/// in DOM order and aligned against the element's innerText one segment at a
+/// time, so plain text that repeats an anchor label is consumed at its own
+/// position instead of being mistaken for the anchor. Hidden or `javascript:`
+/// anchors stay plain text and the page DOM is never mutated.
 const TEXT_WITH_LINKS_JS: &str = r#"function() {
   const text = this.innerText || this.textContent || '';
-  const anchors = [];
-  if (this.matches && this.matches('a[href]')) anchors.push(this);
-  if (this.querySelectorAll) anchors.push(...this.querySelectorAll('a[href]'));
+  const linkable = (a) => {
+    if (a.getClientRects().length === 0 || getComputedStyle(a).visibility !== 'visible') return false;
+    const label = (a.innerText || '').trim();
+    return !!label && !!a.href && !/^javascript:/i.test(a.href);
+  };
+  const rendered = (node) => {
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    if (range.getClientRects().length === 0) return false;
+    const parent = node.parentElement;
+    return !parent || getComputedStyle(parent).visibility === 'visible';
+  };
+  const escape = (word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   let out = '';
   let cursor = 0;
-  for (const a of anchors) {
-    if (a.getClientRects().length === 0) continue;
-    const label = (a.innerText || '').trim();
-    const href = a.href;
-    if (!label || !href || /^javascript:/i.test(href)) continue;
-    const at = text.indexOf(label, cursor);
-    if (at < 0) continue;
-    const md = label.replace(/\s+/g, ' ').replace(/([\[\]])/g, '\\$1');
-    const url = href.replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/\s/g, '%20');
-    out += text.slice(cursor, at) + '[' + md + '](' + url + ')';
-    cursor = at + label.length;
-  }
+  const consume = (raw) => {
+    const words = raw.split(/\s+/).filter(Boolean);
+    if (words.length === 0) return null;
+    const pattern = new RegExp(words.map(escape).join('\\s+'), 'gi');
+    pattern.lastIndex = cursor;
+    const match = pattern.exec(text);
+    if (!match) return null;
+    out += text.slice(cursor, match.index);
+    cursor = match.index + match[0].length;
+    return match[0];
+  };
+  const visit = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const matched = rendered(node) && consume(node.data);
+      if (matched) out += matched;
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    if (node.matches('a[href]') && linkable(node)) {
+      const label = node.innerText.trim();
+      if (consume(label) !== null) {
+        const md = label.replace(/\s+/g, ' ').replace(/([\[\]])/g, '\\$1');
+        const url = node.href.replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/\s/g, '%20');
+        out += '[' + md + '](' + url + ')';
+        return;
+      }
+    }
+    for (const child of node.childNodes) visit(child);
+  };
+  visit(this);
   return out + text.slice(cursor);
 }"#;
 

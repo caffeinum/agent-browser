@@ -2925,6 +2925,65 @@ async fn e2e_tab_switch_rejects_bare_integer() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_gettext_links_attribute_each_anchor_to_its_own_position() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let html = concat!(
+        "data:text/html,<html><body><div id='main'>",
+        "<p>See docs first, then <a href='https://example.com/docs'>docs</a>.</p>",
+        "<p><span style='display:none'>home</span>Back home via <a href='https://example.com/1'>home</a>, ",
+        "not home, but <a href='https://example.com/2'>home</a>.</p>",
+        "<pre>code   <a href='https://example.com/pre'>spaced   link</a></pre>",
+        "</div></body></html>"
+    );
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": html }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "gettext", "selector": "#main" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let plain = get_data(&resp)["text"].as_str().unwrap().to_string();
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "gettext", "selector": "#main", "links": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let linked = get_data(&resp)["text"].as_str().unwrap().to_string();
+    assert_eq!(
+        linked,
+        plain
+            .replacen("then docs", "then [docs](https://example.com/docs)", 1)
+            .replacen("via home", "via [home](https://example.com/1)", 1)
+            .replacen("but home", "but [home](https://example.com/2)", 1)
+            .replacen("spaced   link", "[spaced link](https://example.com/pre)", 1),
+        "plain: {plain:?}"
+    );
+    assert!(
+        linked.starts_with("See docs first, then [docs]"),
+        "{linked}"
+    );
+
+    let resp = execute_command(&json!({ "id": "5", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_gettext_window_links_and_missing_selector() {
     let mut state = DaemonState::new();
     let resp = execute_command(
