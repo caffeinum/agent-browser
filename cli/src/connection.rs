@@ -1475,15 +1475,15 @@ mod tests {
 
     #[test]
     fn long_typing_gets_the_typing_budget() {
-        // 20s + 20ms x 2000 = 60s, plus the 10s margin.
+        // 65s + 20ms x 2000 = 105s, plus the 10s margin.
         let text = "x".repeat(2000);
         assert_eq!(
             read_timeout_for(&json!({"action": "type", "text": text})),
-            Duration::from_secs(70)
+            Duration::from_secs(115)
         );
         assert_eq!(
             read_timeout_for(&json!({"action": "fill", "value": "hi"})),
-            Duration::from_millis(30_040)
+            Duration::from_millis(75_040)
         );
     }
 

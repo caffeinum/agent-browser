@@ -4,7 +4,7 @@ navTitle: "WebKit"
 description: "Drive macOS system WebKit headlessly through webkit-cli over WebDriver."
 ---
 
-The `webkit` provider drives the macOS system WebKit through [webkit-cli](https://github.com/caffeinum/webkit-cli) 0.6.0 or later; older versions are refused at launch. agent-browser runs `webkit-cli webdriver --account <name>` and talks to it over WebDriver. It is built in rather than a `browser.provider` plugin because plugins must return a CDP endpoint.
+The `webkit` provider drives the macOS system WebKit through [webkit-cli](https://github.com/caffeinum/webkit-cli) 0.7.0 or later; older versions are refused at launch. agent-browser runs `webkit-cli webdriver --account <name>` and talks to it over WebDriver. It is built in rather than a `browser.provider` plugin because plugins must return a CDP endpoint.
 
 ## Setup
 
@@ -44,8 +44,8 @@ webkit-cli sends input through the macOS event path, so click, type, press, hove
 - webkit-cli presses only the left mouse button on macOS, so a right- or middle-button click is refused.
 - `select` and clicks on a `<select>` or color input stay synthetic (`isTrusted` is false).
 - A click on an element another element covers (a cookie banner or modal) fails with `Click on <target> did not reach it: <element> is covering it`, followed by how to fix it: close the covering element, `scrollintoview`, or take a fresh `snapshot -i`.
-- webkit-cli types about one character every 3-5ms. `fill` therefore types up to 256 characters key by key and inserts longer text in one step through WebKit's editor, like a paste: `beforeinput` and `input` are trusted, but there are no per-key `keydown`/`keyup` events. Only where the editor refuses the field is the value set directly with untrusted `input` and `change` events. `keyboard inserttext` uses the same one-step insert at the caret.
-- `type` and `keyboard type` stay key by key, within 20s plus 20ms a character. If that runs out, nothing more is sent and the error says how many characters were typed. A command sent while webkit-cli is still delivering keys fails with `webkit-cli is busy ... Retry in a few seconds`; the session stays usable.
+- `fill`, `type`, `keyboard type` and `keyboard inserttext` send their text in one WebDriver call at any length. webkit-cli inserts each run of 64 or more plain characters at once as a trusted `insertText` (`beforeinput` and `input`, no per-key `keydown`/`keyup`; 12,000 characters take about 0.05s), and types shorter runs, such as short text or lines under 64 characters, key by key with trusted key events. `type` appends; for long text use `fill`.
+- webkit-cli stops typing at its 60s input deadline and drops the keys it has not sent, so nothing is left queued; the command fails with `Typing did not finish: webkit-cli stopped at its input deadline ...`. A command sent while webkit-cli is still busy fails with `... busy ... Retry in a few seconds`; the session stays usable.
 
 Tabs, set viewport, upload, pdf, find, mouse, network, console, errors, trace and other CDP tools are refused with an error naming the command and either `workaround: eval` or `no workaround on WebDriver`.
 

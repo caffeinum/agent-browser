@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// Abstract backend for browser automation. CDP (Chromium) and WebDriver
 /// (Safari/iOS) share this interface so actions.rs can remain backend-agnostic
@@ -50,9 +50,6 @@ pub struct WebDriverBackend {
     /// driver still does not answer. Drivers such as webkit-cli answer
     /// nothing else until that ends.
     busy: std::sync::Mutex<Option<String>>,
-    /// Fill text longer than this is inserted in one step instead of typed
-    /// key by key (webkit-cli types at 3-5ms a character).
-    bulk_fill_over: Option<usize>,
     /// The session's W3C page-load timeout when the driver enforces one
     /// (webkit-cli). It always sits below the client's backstop.
     page_load_timeout: std::sync::Mutex<Option<std::time::Duration>>,
@@ -101,16 +98,9 @@ impl WebDriverBackend {
             client,
             label: "WebDriver server".to_string(),
             busy: std::sync::Mutex::new(None),
-            bulk_fill_over: None,
             page_load_timeout: std::sync::Mutex::new(None),
             own_page_load: false,
         }
-    }
-
-    /// Insert fill text longer than `chars` in one step (see `insert_text`).
-    pub fn with_bulk_fill_over(mut self, chars: usize) -> Self {
-        self.bulk_fill_over = Some(chars);
-        self
     }
 
     fn set_busy(&self, message: String) {
@@ -413,23 +403,18 @@ impl WebDriverBackend {
         })
     }
 
-    /// Clear the field and enter `value`: key by key up to the bulk-fill
-    /// threshold, in one step (`insert_text`) beyond it.
+    /// Clear the field and send `value` with Element Send Keys.
     pub async fn fill_element(&self, element_id: &str, value: &str) -> Result<(), String> {
-        if self
-            .bulk_fill_over
-            .is_some_and(|limit| value.chars().count() > limit)
-        {
-            return self.insert_text(element_id, value, true).await.map(|_| ());
-        }
         self.ensure_idle().await?;
         self.client.clear_element(element_id).await?;
         self.type_text(element_id, value, None).await
     }
 
-    /// Type `text` key by key, in chunks, within a budget that scales with
-    /// its length ([`super::typing_budget_ms`]). Once the budget is spent no
-    /// further keys are sent, so a timed-out command does not keep typing.
+    /// Send `text` with Element Send Keys in one call at every length:
+    /// webkit-cli 0.7.0 inserts each run of 64+ plain characters as one
+    /// trusted insertText and types shorter runs key by key. The call may
+    /// take [`super::typing_budget_ms`]. With a `delay`, keys go one call at
+    /// a time and nothing more is sent once that budget is spent.
     pub async fn type_text(
         &self,
         element_id: &str,
@@ -443,95 +428,55 @@ impl WebDriverBackend {
             super::typing_budget_ms(total)
                 .saturating_add(delay.map_or(0, |d| d.as_millis() as u64 * total as u64)),
         );
+        let Some(delay) = delay else {
+            return self.send_keys_for_typing(element_id, text, budget).await;
+        };
         let deadline = std::time::Instant::now() + budget;
-        let step = if delay.is_some() { 1 } else { TYPE_CHUNK };
-        let mut sent = 0;
-        for chunk in chars.chunks(step) {
+        for (sent, ch) in chars.iter().enumerate() {
             let now = std::time::Instant::now();
             if now >= deadline {
-                return Err(self.typing_stopped(sent, total, budget, false));
+                return Err(format!(
+                    "Typing stopped after {} of {} characters: it did not finish within {}s. Nothing more is sent; check the field's value before typing the rest",
+                    sent,
+                    total,
+                    budget.as_secs_f32()
+                ));
             }
-            let piece: String = chunk.iter().collect();
-            let limit = (deadline - now).min(self.client.limits().command);
-            match self
-                .client
-                .send_keys_within(element_id, &piece, limit)
-                .await
-            {
-                Ok(()) => {}
-                // The driver may still be delivering this chunk: say so to
-                // later commands until it answers again.
-                Err(e) if e.contains(super::client::NO_ANSWER) => {
-                    self.set_busy(format!(
-                        "{} is busy typing text a previous command sent. Retry in a few seconds",
-                        self.label
-                    ));
-                    return Err(self.typing_stopped(sent, total, budget, true));
-                }
-                Err(e) => return Err(e),
-            }
-            sent += chunk.len();
-            if let Some(d) = delay {
-                tokio::time::sleep(d).await;
-            }
+            self.send_keys_for_typing(element_id, &ch.to_string(), deadline - now)
+                .await?;
+            tokio::time::sleep(delay).await;
         }
         Ok(())
     }
 
-    fn typing_stopped(
-        &self,
-        sent: usize,
-        total: usize,
-        budget: std::time::Duration,
-        in_flight: bool,
-    ) -> String {
-        format!(
-            "Typing stopped after {} of {} characters: it did not finish within {}s. Nothing more is sent{}; check the field's value before typing the rest",
-            sent,
-            total,
-            budget.as_secs_f32(),
-            if in_flight {
-                format!(
-                    " ({} may still be delivering the last {} or fewer characters)",
-                    self.label, TYPE_CHUNK
-                )
-            } else {
-                String::new()
-            }
-        )
-    }
-
-    /// Insert `text` in one step at the caret of `element_id` (focused
-    /// first), replacing its content when `replace`. WebKit's editor does it
-    /// (`execCommand('insertText')`), so beforeinput/input are trusted and
-    /// the time does not grow with length; there are no per-key events.
-    /// Where the editor refuses (e.g. an input type without a caret), the
-    /// value is set directly and input/change dispatched (untrusted).
-    /// Returns whether the trusted path was used.
-    pub async fn insert_text(
+    async fn send_keys_for_typing(
         &self,
         element_id: &str,
         text: &str,
-        replace: bool,
-    ) -> Result<bool, String> {
-        self.ensure_idle().await?;
-        let result = self
-            .execute_function_body(
-                INSERT_TEXT_JS,
-                vec![
-                    super::dom_refs::element_arg(element_id),
-                    json!(text),
-                    json!(replace),
-                ],
-            )
-            .await?;
-        if let Some(problem) = result.get("error").and_then(Value::as_str) {
-            return Err(problem.to_string());
+        limit: std::time::Duration,
+    ) -> Result<(), String> {
+        match self.client.send_keys_within(element_id, text, limit).await {
+            Ok(()) => Ok(()),
+            // webkit-cli 0.7.0 stops at its input deadline and drops the keys
+            // it has not sent, then answers `timeout`; it stays usable.
+            Err(e) if e.starts_with("WebDriver timeout ") => Err(format!(
+                "Typing did not finish: {} stopped at its input deadline and dropped the keys it had not sent, so nothing more is typed. Check the field's value before typing the rest",
+                self.label
+            )),
+            // No answer within the budget: the driver may still be typing.
+            Err(e) if e.contains(super::client::NO_ANSWER) => {
+                self.set_busy(format!(
+                    "{} is busy typing text a previous command sent. Retry in a few seconds",
+                    self.label
+                ));
+                Err(format!(
+                    "Typing did not finish within {}s and {} may still be typing it; later commands say it is busy until it is done",
+                    limit.as_secs_f32(),
+                    self.label
+                ))
+            }
+            Err(e) => Err(e),
         }
-        Ok(result
-            .get("trusted")
-            .and_then(Value::as_bool)
-            .unwrap_or(false))
     }
 
     /// The focused element (`document.activeElement`), for keyboard input.
@@ -544,46 +489,6 @@ impl WebDriverBackend {
         .ok_or_else(|| "No element has focus and the page has no body".to_string())
     }
 }
-
-/// Characters per Element Send Keys call when typing without a delay.
-const TYPE_CHUNK: usize = 32;
-
-/// `insert_text`: arguments are (element, text, replace).
-const INSERT_TEXT_JS: &str = "var el = arguments[0], text = arguments[1], replace = arguments[2];
-var field = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA';
-if (!field && !el.isContentEditable) {
-  return { error: 'cannot enter text into <' + el.tagName.toLowerCase() + '>: it is not an input, textarea or contenteditable element' };
-}
-el.focus();
-if (replace) {
-  if (field) {
-    try { el.select(); } catch (e) {}
-  } else {
-    var r = document.createRange(); r.selectNodeContents(el);
-    var s = getSelection(); s.removeAllRanges(); s.addRange(r);
-  }
-}
-var trusted = false;
-try { trusted = document.execCommand('insertText', false, text); } catch (e) {}
-if (!trusted) {
-  if (field) {
-    var proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    var set = Object.getOwnPropertyDescriptor(proto, 'value').set;
-    var next = text;
-    if (!replace) {
-      try { next = el.value.slice(0, el.selectionStart) + text + el.value.slice(el.selectionEnd); }
-      catch (e) { next = el.value + text; }
-    }
-    set.call(el, next);
-  } else if (replace) {
-    el.textContent = text;
-  } else {
-    el.textContent += text;
-  }
-  el.dispatchEvent(new Event('input', { bubbles: true }));
-  el.dispatchEvent(new Event('change', { bubbles: true }));
-}
-return { trusted: trusted };";
 
 #[async_trait]
 impl BrowserBackend for WebDriverBackend {

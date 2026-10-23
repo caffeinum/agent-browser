@@ -64,6 +64,8 @@ pub async fn execute(
         }
         "keyboard" => {
             // Into whatever has focus, like Chrome's keyboard type/inserttext.
+            // Both use Element Send Keys: webkit-cli 0.7.0 inserts long plain
+            // runs as one trusted insertText already.
             let text = required(cmd, "text")?;
             let el = wb.focused_element().await?;
             match cmd.get("subaction").and_then(Value::as_str) {
@@ -72,7 +74,7 @@ pub async fn execute(
                     Ok(json!({ "typed": text }))
                 }
                 Some("insertText") => {
-                    wb.insert_text(&el, text, false).await?;
+                    wb.type_text(&el, text, None).await?;
                     Ok(json!({ "inserted": text }))
                 }
                 other => Err(format!(
