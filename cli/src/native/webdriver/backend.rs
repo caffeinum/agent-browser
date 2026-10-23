@@ -48,6 +48,23 @@ pub struct WebDriverBackend {
     /// What the driver is still loading after a navigation outlived its
     /// limit. Drivers such as webkit-cli answer nothing else until it ends.
     busy_loading: std::sync::Mutex<Option<String>>,
+    /// The session's W3C page-load timeout when the driver enforces one
+    /// (webkit-cli). It always sits below the client's backstop.
+    page_load_timeout: std::sync::Mutex<Option<std::time::Duration>>,
+}
+
+/// A driver-enforced page-load timeout strictly below a client backstop, so
+/// the driver reports the timeout and stays usable before the client gives up.
+pub fn page_load_timeout_below(backstop: std::time::Duration) -> std::time::Duration {
+    backstop * 4 / 5
+}
+
+/// One page-loading call, for messages.
+pub struct Load {
+    /// "navigation to https://x", "navigation started by a click on https://x".
+    pub phrase: String,
+    /// What a busy driver is still loading: "https://x", "the previous page".
+    pub what: String,
 }
 
 /// How long a command waits to learn whether a busy driver is free again.
@@ -59,7 +76,20 @@ impl WebDriverBackend {
             client,
             label: "WebDriver server".to_string(),
             busy_loading: std::sync::Mutex::new(None),
+            page_load_timeout: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Record the page-load timeout the session was created with.
+    pub fn with_page_load_timeout(self, timeout: std::time::Duration) -> Self {
+        if let Ok(mut current) = self.page_load_timeout.lock() {
+            *current = Some(timeout);
+        }
+        self
+    }
+
+    fn current_page_load_timeout(&self) -> Option<std::time::Duration> {
+        self.page_load_timeout.lock().ok().and_then(|t| *t)
     }
 
     pub fn with_label(mut self, label: &str) -> Self {
@@ -89,21 +119,38 @@ impl WebDriverBackend {
 
     /// Run a page-loading call; when it outlives its limit, remember what is
     /// loading and say so.
-    async fn loading<F>(&self, target: String, call: F) -> Result<(), String>
+    async fn loading<F>(
+        &self,
+        load: Load,
+        backstop: std::time::Duration,
+        call: F,
+    ) -> Result<(), String>
     where
         F: std::future::Future<Output = Result<(), String>>,
     {
         self.ensure_idle().await?;
         match call.await {
+            // The driver enforced its page-load timeout and stays usable.
+            Err(e) if e.starts_with("WebDriver timeout ") => {
+                let limit = self.current_page_load_timeout().unwrap_or(backstop);
+                Err(format!(
+                    "{} did not finish within {}s; the page may be partly loaded",
+                    capitalize(&load.phrase),
+                    limit.as_secs_f32()
+                ))
+            }
+            // The driver never answered: it is still loading and will answer
+            // nothing else until that ends.
             Err(e) if e.contains(super::client::NO_ANSWER) => {
                 if let Ok(mut busy) = self.busy_loading.lock() {
-                    *busy = Some(target.clone());
+                    *busy = Some(load.what.clone());
                 }
                 Err(format!(
-                    "{} did not finish loading within {}s; {} is still loading it. Later commands fail until it finishes; `agent-browser close` abandons it",
-                    target,
-                    self.client.limits().page_load.as_secs_f32(),
-                    self.label
+                    "{} did not finish within {}s; {} is still loading {}. Later commands fail until it finishes; `agent-browser close` abandons it",
+                    capitalize(&load.phrase),
+                    backstop.as_secs_f32(),
+                    self.label,
+                    load.what
                 ))
             }
             other => other,
@@ -116,8 +163,27 @@ impl WebDriverBackend {
         url: &str,
         limit: std::time::Duration,
     ) -> Result<(), String> {
-        self.loading(url.to_string(), self.client.navigate_within(url, limit))
+        // Keep a driver-enforced page-load timeout below this call's backstop.
+        if let Some(current) = self.current_page_load_timeout() {
+            let wanted = page_load_timeout_below(limit);
+            if wanted != current {
+                self.ensure_idle().await?;
+                self.client.set_timeouts(wanted).await?;
+                if let Ok(mut t) = self.page_load_timeout.lock() {
+                    *t = Some(wanted);
+                }
+            }
+        }
+        let load = Load {
+            phrase: format!("navigation to {}", url),
+            what: url.to_string(),
+        };
+        self.loading(load, limit, self.client.navigate_within(url, limit))
             .await
+    }
+
+    fn page_load_backstop(&self) -> std::time::Duration {
+        self.client.limits().page_load
     }
 
     /// Evaluate `expression` like CDP Runtime.evaluate: the value of the last
@@ -189,12 +255,21 @@ impl WebDriverBackend {
     /// and tracked like one.
     pub async fn click_element(&self, element_id: &str) -> Result<(), String> {
         self.ensure_idle().await?;
-        let target = match self.client.get_url().await {
-            Ok(url) => format!("the page opened by a click on {}", url),
-            Err(_) => "the page opened by a click".to_string(),
-        };
-        self.loading(target, self.client.click_element(element_id))
+        let from = self
+            .client
+            .get_url()
             .await
+            .unwrap_or_else(|_| "the current page".to_string());
+        let load = Load {
+            phrase: format!("navigation started by a click on {}", from),
+            what: format!("the page opened by a click on {}", from),
+        };
+        self.loading(
+            load,
+            self.client.limits().command,
+            self.client.click_element(element_id),
+        )
+        .await
     }
 
     pub async fn fill_element(&self, element_id: &str, value: &str) -> Result<(), String> {
@@ -206,8 +281,7 @@ impl WebDriverBackend {
 #[async_trait]
 impl BrowserBackend for WebDriverBackend {
     async fn navigate(&self, url: &str) -> Result<(), String> {
-        self.loading(url.to_string(), self.client.navigate(url))
-            .await
+        self.navigate_within(url, self.page_load_backstop()).await
     }
 
     async fn get_url(&self) -> Result<String, String> {
@@ -246,17 +320,29 @@ impl BrowserBackend for WebDriverBackend {
     }
 
     async fn back(&self) -> Result<(), String> {
-        self.loading("the previous page".to_string(), self.client.back())
+        let load = Load {
+            phrase: "navigation back".to_string(),
+            what: "the previous page".to_string(),
+        };
+        self.loading(load, self.page_load_backstop(), self.client.back())
             .await
     }
 
     async fn forward(&self) -> Result<(), String> {
-        self.loading("the next page".to_string(), self.client.forward())
+        let load = Load {
+            phrase: "navigation forward".to_string(),
+            what: "the next page".to_string(),
+        };
+        self.loading(load, self.page_load_backstop(), self.client.forward())
             .await
     }
 
     async fn reload(&self) -> Result<(), String> {
-        self.loading("the reloaded page".to_string(), self.client.refresh())
+        let load = Load {
+            phrase: "reload".to_string(),
+            what: "the reloaded page".to_string(),
+        };
+        self.loading(load, self.page_load_backstop(), self.client.refresh())
             .await
     }
 
@@ -266,6 +352,14 @@ impl BrowserBackend for WebDriverBackend {
 
     fn backend_type(&self) -> &str {
         "webdriver"
+    }
+}
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 

@@ -95,6 +95,18 @@ impl WebDriverClient {
         Ok(())
     }
 
+    /// Set the session's page-load and script timeouts (W3C /timeouts).
+    pub async fn set_timeouts(&self, page_load: Duration) -> Result<(), String> {
+        let sid = self.session_id()?.to_string();
+        let ms = page_load.as_millis() as u64;
+        self.post(
+            &format!("/session/{}/timeouts", sid),
+            &json!({ "pageLoad": ms, "script": ms }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// GET the current URL with a short limit, to tell a busy driver from an
     /// idle one without waiting out the normal command budget.
     pub async fn probe_url(&self, limit: Duration) -> Result<String, String> {

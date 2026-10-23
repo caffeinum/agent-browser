@@ -28,11 +28,9 @@ async fn run_dom_walk(wb: &WebDriverBackend, options: &SnapshotOptions) -> Resul
     wb.execute_function_body(&snapshot::dom_snapshot_script(options), vec![])
         .await
         .map_err(|e| {
+            // Worded without "timeout" so the generic error rewriting keeps it.
             if e.contains("script timeout") {
-                format!(
-                    "Snapshot timed out in the page ({}). Narrow it with `snapshot -s <selector>`.",
-                    e
-                )
+                "Snapshot did not finish within the page's script time limit. Narrow it with `snapshot -s <selector>`.".to_string()
             } else {
                 e
             }
@@ -299,7 +297,12 @@ mod tests {
         let err = take_snapshot(&backend(port), &SnapshotOptions::default(), &mut refs)
             .await
             .unwrap_err();
-        assert!(err.contains("Snapshot timed out"), "{}", err);
+        assert!(err.contains("Snapshot did not finish"), "{}", err);
+        assert!(
+            !err.to_lowercase().contains("timeout"),
+            "kept intact by error rewriting: {}",
+            err
+        );
         assert!(err.contains("snapshot -s"), "{}", err);
     }
 

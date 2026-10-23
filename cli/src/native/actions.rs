@@ -5627,6 +5627,13 @@ async fn launch_webkit(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         Some(p) => u16::try_from(p).map_err(|_| format!("Invalid WebDriver port: {}", p))?,
         None => 0,
     };
+    // webkit-cli enforces the page-load and script timeouts itself, below the
+    // client backstop, and answers `timeout` while staying usable. "eager"
+    // returns once the DOM is ready instead of waiting for every subresource.
+    let page_load = super::webdriver::backend::page_load_timeout_below(
+        std::time::Duration::from_millis(state.default_timeout_ms),
+    );
+    let page_load_ms = page_load.as_millis() as u64;
     let mut result = launch_local_webdriver(
         state,
         LocalWebDriver {
@@ -5634,10 +5641,17 @@ async fn launch_webkit(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             driver_label: "webkit-cli",
             identity: format!("{}{}", WEBKIT_IDENTITY_PREFIX, account),
             engine: "webkit",
-            capabilities: json!({}),
+            capabilities: json!({
+                "pageLoadStrategy": "eager",
+                "timeouts": { "pageLoad": page_load_ms, "script": page_load_ms },
+            }),
+            page_load_timeout: Some(page_load),
             stop_command: Some((binary.clone(), webkit::stop_args(&account))),
         },
-        || webkit::launch_webkit_cli(&binary, &account, port),
+        || async {
+            webkit::require_supported_version(&binary).await?;
+            webkit::launch_webkit_cli(&binary, &account, port).await
+        },
     )
     .await?;
     result["account"] = json!(account);
@@ -5657,6 +5671,7 @@ async fn launch_safari(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             engine: "safari",
             capabilities: json!({ "browserName": "safari" }),
             stop_command: None,
+            page_load_timeout: None,
         },
         || safari::launch_safaridriver(port),
     )
@@ -5682,6 +5697,8 @@ struct LocalWebDriver {
     capabilities: Value,
     /// Run on close after the driver stops (program, args).
     stop_command: Option<(std::path::PathBuf, Vec<String>)>,
+    /// Page-load timeout the driver enforces for this session, if any.
+    page_load_timeout: Option<std::time::Duration>,
 }
 
 /// Launch a locally spawned WebDriver server, or reuse the live session when
@@ -5724,7 +5741,11 @@ where
     client.create_session(spec.capabilities).await?;
 
     state.webdriver_process = Some(driver);
-    state.webdriver_backend = Some(WebDriverBackend::new(client).with_label(spec.driver_label));
+    let mut backend = WebDriverBackend::new(client).with_label(spec.driver_label);
+    if let Some(timeout) = spec.page_load_timeout {
+        backend = backend.with_page_load_timeout(timeout);
+    }
+    state.webdriver_backend = Some(backend);
     state.webdriver_identity = Some(spec.identity);
     state.webdriver_stop_command = spec.stop_command;
     state.backend_type = BackendType::WebDriver;
@@ -15926,6 +15947,7 @@ mod tests {
             engine: "safari",
             capabilities: json!({}),
             stop_command: None,
+            page_load_timeout: None,
         }
     }
 
@@ -16837,7 +16859,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert!(error.contains("http://hang.test/"), "{}", error);
         assert!(error.contains("within 0.8s"), "{}", error);
         assert!(
-            error.contains("webkit-cli is still loading it"),
+            error.contains("webkit-cli is still loading http://hang.test/"),
             "{}",
             error
         );
@@ -16873,6 +16895,94 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert!(std::fs::read_to_string(&log)
             .unwrap()
             .contains("stop ab-test"));
+    }
+
+    /// webkit-cli 0.5.0 enforces the session pageLoad (requested below the
+    /// client backstop) and answers 500 `timeout`; that maps to a clear error
+    /// and the next command runs normally.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_driver_page_load_timeout_is_reported_and_session_stays_usable() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _launch, _log) = launch_fake_webkit_with_limit(dir.path(), 1000).await;
+
+        let started = std::time::Instant::now();
+        let open = execute_command(
+            &json!({ "id": "o", "action": "navigate", "url": "http://deadline.test/" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(open["success"], false, "{}", open);
+        assert_eq!(
+            open["error"],
+            "Navigation to http://deadline.test/ did not finish within 0.8s; the page may be partly loaded"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1000),
+            "driver timeout must come before the backstop"
+        );
+
+        let url = execute_command(&json!({ "id": "u", "action": "url" }), &mut state).await;
+        assert_eq!(url["data"]["url"], "http://deadline.test/", "{}", url);
+
+        // A per-command --timeout moves the driver's pageLoad below it too.
+        let longer = execute_command(
+            &json!({ "id": "o2", "action": "navigate", "url": "http://deadline.test/again", "timeout": 2000 }),
+            &mut state,
+        )
+        .await;
+        assert!(
+            longer["error"]
+                .as_str()
+                .unwrap()
+                .contains("did not finish within 1.6s"),
+            "{}",
+            longer
+        );
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_webkit_cli_older_than_0_5_is_refused_at_launch() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+            "FAKE_WD_VERSION",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        guard.set("FAKE_WD_VERSION", "webkit-cli 0.4.2");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("launches.log");
+        let bin = fake_webkit_cli(dir.path(), &log);
+        let mut state = DaemonState::new();
+        let err = handle_launch(
+            &json!({
+                "action": "launch",
+                "provider": "webkit",
+                "executablePath": bin.to_str().unwrap(),
+                "webkitAccount": "ab-test",
+            }),
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("webkit-cli 0.4.2"), "{}", err);
+        assert!(err.contains("needs 0.5.0 or later"), "{}", err);
+        assert!(!log.exists(), "an old webkit-cli must not be started");
     }
 
     /// Once a slow load finishes, the session is usable again; click and back
@@ -16929,7 +17039,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert_eq!(click["success"], false, "{}", click);
         let error = click["error"].as_str().unwrap();
         assert!(
-            error.contains("a click on http://ok.test/hang-later"),
+            error.contains("Navigation started by a click on http://ok.test/hang-later did not finish within 0.8s"),
             "{}",
             error
         );
@@ -16950,7 +17060,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             back["error"]
                 .as_str()
                 .unwrap()
-                .contains("the previous page did not finish loading within 0.8s"),
+                .contains("Navigation back did not finish within 0.8s"),
             "{}",
             back
         );

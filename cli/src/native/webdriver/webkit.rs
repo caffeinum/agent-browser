@@ -13,7 +13,7 @@ pub const WEBKIT_CLI_ENV: &str = "AGENT_BROWSER_WEBKIT_CLI";
 pub const WEBKIT_ACCOUNT_ENV: &str = "AGENT_BROWSER_WEBKIT_ACCOUNT";
 const BINARY_NAME: &str = "webkit-cli";
 const INSTALL_HINT: &str =
-    "Install webkit-cli 0.4.0 or later (https://github.com/caffeinum/webkit-cli)";
+    "Install webkit-cli 0.5.0 or later (https://github.com/caffeinum/webkit-cli)";
 
 /// Resolve the webkit-cli binary: `--executable-path`, then
 /// `AGENT_BROWSER_WEBKIT_CLI`, then `webkit-cli` on PATH.
@@ -77,6 +77,61 @@ pub fn webdriver_args(account: &str, port: u16) -> Vec<String> {
     ]
 }
 
+/// Oldest webkit-cli with what the provider relies on: honored
+/// pageLoadStrategy, session timeouts, and commands that keep working after
+/// a navigation times out.
+pub const MIN_VERSION: (u64, u64, u64) = (0, 5, 0);
+
+/// Parse `webkit-cli 0.5.0` (or a bare `0.5.0`).
+pub fn parse_version(output: &str) -> Option<(u64, u64, u64)> {
+    let token = output
+        .split_whitespace()
+        .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
+    let mut parts = token.split(|c: char| c == '.' || c == '-' || c == '+');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// Fail before launching when webkit-cli is older than [`MIN_VERSION`].
+pub async fn require_supported_version(binary: &Path) -> Result<(), String> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(binary)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("`{} --version` did not finish within 10s", binary.display()))?
+    .map_err(|e| format!("Failed to run `{} --version`: {}", binary.display(), e))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (major, minor, patch) = MIN_VERSION;
+    match parse_version(&text) {
+        Some(found) if found >= MIN_VERSION => Ok(()),
+        Some((a, b, c)) => Err(format!(
+            "webkit-cli {}.{}.{} at {} is too old: -p webkit needs {}.{}.{} or later. {}.",
+            a,
+            b,
+            c,
+            binary.display(),
+            major,
+            minor,
+            patch,
+            INSTALL_HINT
+        )),
+        None => Err(format!(
+            "Could not read the webkit-cli version from `{} --version` (got {:?}). -p webkit needs {}.{}.{} or later.",
+            binary.display(),
+            text.trim(),
+            major,
+            minor,
+            patch
+        )),
+    }
+}
+
 /// `webkit-cli stop --account NAME`: ends the account's background session
 /// (it outlives `webkit-cli webdriver` by design) so `close` leaves nothing
 /// running.
@@ -128,6 +183,31 @@ fn describe_launch_failure(error: DriverError, binary: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_webkit_cli_versions() {
+        assert_eq!(parse_version("webkit-cli 0.5.0\n"), Some((0, 5, 0)));
+        assert_eq!(parse_version("0.4.2"), Some((0, 4, 2)));
+        assert_eq!(parse_version("webkit-cli 1.2"), Some((1, 2, 0)));
+        assert_eq!(parse_version("webkit-cli"), None);
+        assert!(parse_version("webkit-cli 0.4.2").unwrap() < MIN_VERSION);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn old_webkit_cli_is_refused_with_its_version() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join(BINARY_NAME);
+        std::fs::write(&bin, "#!/bin/sh\necho 'webkit-cli 0.4.2'\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = require_supported_version(&bin).await.unwrap_err();
+        assert!(err.contains("webkit-cli 0.4.2"), "{}", err);
+        assert!(err.contains("needs 0.5.0 or later"), "{}", err);
+
+        std::fs::write(&bin, "#!/bin/sh\necho 'webkit-cli 0.5.0'\n").unwrap();
+        require_supported_version(&bin).await.unwrap();
+    }
 
     #[test]
     fn args_pass_account_and_port() {
@@ -191,7 +271,7 @@ mod tests {
             "got: {}",
             err
         );
-        assert!(err.contains("0.4.0"), "got: {}", err);
+        assert!(err.contains("0.5.0"), "got: {}", err);
     }
 
     #[cfg(unix)]

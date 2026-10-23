@@ -13,6 +13,9 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print(os.environ.get("FAKE_WD_VERSION", "webkit-cli 0.5.0"))
+    sys.exit(0)
 if args[:1] == ["stop"]:
     # `webkit-cli stop --account NAME`
     if os.environ.get("FAKE_WD_LOG"):
@@ -84,6 +87,9 @@ class Handler(BaseHTTPRequestHandler):
         data = self.body()
         if self.path == "/session":
             state["sessions"] += 1
+            caps = data.get("capabilities", {}).get("alwaysMatch", {})
+            state["page_load_ms"] = caps.get("timeouts", {}).get("pageLoad")
+            state["strategy"] = caps.get("pageLoadStrategy")
             sid = "s%d" % state["sessions"]
             state["sid"] = sid
             return self.reply({"sessionId": sid, "capabilities": {"account": account}})
@@ -93,11 +99,20 @@ class Handler(BaseHTTPRequestHandler):
         # loading, "slow.test" takes 2s, and on a "hang-later" page a click or
         # back starts a load that never finishes.
         if self.path == "/session/%s/url" % sid:
+            if "deadline.test" in data["url"]:
+                # webkit-cli 0.5.0: enforce the session pageLoad, answer
+                # `timeout`, and keep serving later commands.
+                time.sleep((state.get("page_load_ms") or 0) / 1000.0)
+                state["url"] = data["url"]
+                return self.reply({"error": "timeout", "message": "goto timed out"}, 500)
             if "hang.test" in data["url"]:
                 time.sleep(3600)
             if "slow.test" in data["url"]:
                 time.sleep(2)
             state["url"] = data["url"]
+            return self.reply(None)
+        if self.path == "/session/%s/timeouts" % sid:
+            state["page_load_ms"] = data.get("pageLoad", state.get("page_load_ms"))
             return self.reply(None)
         if self.path == "/session/%s/execute/sync" % sid:
             return self.reply(execute(data["script"]))
