@@ -518,10 +518,11 @@ Engine setup and limits: [Lightpanda](https://agent-browser.dev/engines/lightpan
 
 `agent-browser -p webkit --webkit-account <name> <command>` drives macOS system WebKit through webkit-cli 0.6.0+ (`webkit-cli create <name>` first). It keeps one webkit-cli per account across commands; `close` stops it.
 
-- Works: open, back, forward, reload, snapshot, click, fill, type, press (including Control+a, Shift+Tab), select, check, uncheck, scroll, scrollintoview, focus, hover, dblclick, wait (ms, selector, --text, --url, --fn, --load load|domcontentloaded), get text, get url, get title, get attr, get html, get value, get count, is visible, is enabled, is checked, eval, screenshot, cookies, read, close. `snapshot -i` output and `@eN` refs use the same format as Chrome.
-- Refused: tabs, set viewport, upload, pdf, find, keyboard type, mouse, network, console, errors, trace (no workaround on WebDriver, or eval where it says so), and right- or middle-button clicks (webkit-cli presses only the left button on macOS).
+- Works: open, back, forward, reload, snapshot, click, fill, type, press (including Control+a, Shift+Tab), select, check, uncheck, scroll, scrollintoview, focus, hover, dblclick, keyboard type, keyboard inserttext, wait (ms, selector, --text, --url, --fn, --load load|domcontentloaded), get text, get url, get title, get attr, get html, get value, get count, is visible, is enabled, is checked, eval, screenshot, cookies, read, close. `snapshot -i` output and `@eN` refs use the same format as Chrome.
+- Refused: tabs, set viewport, upload, pdf, find, mouse, network, console, errors, trace (no workaround on WebDriver, or eval where it says so), and right- or middle-button clicks (webkit-cli presses only the left button on macOS).
 - Clicks return at once; the next command waits for the page the click opened. A page that does not load in time fails with `Navigation to <url> did not ... within <n>s`.
 - Input is trusted (`isTrusted` true; `:hover` applies), except `select` and clicks on `<select>` or color inputs, which stay synthetic.
+- `fill` over 256 characters is inserted in one step like a paste (trusted `input`, no per-key keydown/keyup); up to 256 it is typed key by key. `type` and `keyboard type` are key by key (about 3-5ms a character). After a typing timeout nothing more is sent; a `busy ... Retry` error means wait a few seconds, not close.
 - A click on a covered element fails with `Click on <target> did not reach it: <element> is covering it`: close that element, `scrollintoview`, or `snapshot -i` again.
 - Rejected options: --proxy, --headers, --user-agent, --state, --extension, --init-script, --enable, --download-path, --args, --color-scheme, --profile, --ca-cert, --allowed-domains.
 

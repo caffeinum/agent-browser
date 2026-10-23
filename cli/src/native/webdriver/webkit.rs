@@ -83,6 +83,12 @@ pub fn webdriver_args(account: &str, port: u16) -> Vec<String> {
 /// with element handles kept out of the DOM (0.6.0).
 pub const MIN_VERSION: (u64, u64, u64) = (0, 6, 0);
 
+/// `fill` types up to this many characters key by key (trusted keydown,
+/// keypress, input, keyup, as a person would) and inserts longer text in one
+/// step: webkit-cli 0.6.0 types at 3-5ms a character, so 12,000 characters
+/// would take about a minute.
+pub const BULK_FILL_OVER: usize = 256;
+
 /// Parse `webkit-cli 0.5.0` (or a bare `0.5.0`).
 pub fn parse_version(output: &str) -> Option<(u64, u64, u64)> {
     let token = output

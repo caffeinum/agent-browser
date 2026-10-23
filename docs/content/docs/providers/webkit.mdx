@@ -35,7 +35,7 @@ If webkit-cli exits, the next command fails with `webkit WebDriver driver exited
 
 ## Supported commands
 
-Open, back, forward, reload, snapshot, click, fill, type, press, select, check, uncheck, scroll, scrollintoview, focus, hover, dblclick, wait (ms, selector, --text, --url, --fn, --load load|domcontentloaded), get text, get url, get title, get attr, get html, get value, get count, is visible, is enabled, is checked, eval, screenshot, cookies, read, close, with `@ref` or CSS selectors. Snapshots use the same format and refs as Chrome and are computed in the page from the DOM; iframe contents are not expanded. `get text` has the same 50000-character default cap.
+Open, back, forward, reload, snapshot, click, fill, type, press, select, check, uncheck, scroll, scrollintoview, focus, hover, dblclick, keyboard type, keyboard inserttext, wait (ms, selector, --text, --url, --fn, --load load|domcontentloaded), get text, get url, get title, get attr, get html, get value, get count, is visible, is enabled, is checked, eval, screenshot, cookies, read, close, with `@ref` or CSS selectors (`keyboard` goes to the focused element). Snapshots use the same format and refs as Chrome and are computed in the page from the DOM; iframe contents are not expanded. `get text` has the same 50000-character default cap.
 
 Navigations and clicks return once dispatched (WebDriver pageLoadStrategy "none"). `open`, `back`, `forward` and `reload` then wait until the new page is past DOMContentLoaded, and any later command first waits for a navigation the previous command started to commit, so it never reads the old page. That wait is 80% of the command timeout (`AGENT_BROWSER_DEFAULT_TIMEOUT`, 25s by default, or `--timeout`); a page that does not start or finish in time fails with `Navigation to <url> did not start/finish loading within <n>s`.
 
@@ -44,8 +44,10 @@ webkit-cli sends input through the macOS event path, so click, type, press, hove
 - webkit-cli presses only the left mouse button on macOS, so a right- or middle-button click is refused.
 - `select` and clicks on a `<select>` or color input stay synthetic (`isTrusted` is false).
 - A click on an element another element covers (a cookie banner or modal) fails with `Click on <target> did not reach it: <element> is covering it`, followed by how to fix it: close the covering element, `scrollintoview`, or take a fresh `snapshot -i`.
+- webkit-cli types about one character every 3-5ms. `fill` therefore types up to 256 characters key by key and inserts longer text in one step through WebKit's editor, like a paste: `beforeinput` and `input` are trusted, but there are no per-key `keydown`/`keyup` events. Only where the editor refuses the field is the value set directly with untrusted `input` and `change` events. `keyboard inserttext` uses the same one-step insert at the caret.
+- `type` and `keyboard type` stay key by key, within 20s plus 20ms a character. If that runs out, nothing more is sent and the error says how many characters were typed. A command sent while webkit-cli is still delivering keys fails with `webkit-cli is busy ... Retry in a few seconds`; the session stays usable.
 
-Tabs, set viewport, upload, pdf, find, keyboard type, mouse, network, console, errors, trace and other CDP tools are refused with an error naming the command and either `workaround: eval` or `no workaround on WebDriver`.
+Tabs, set viewport, upload, pdf, find, mouse, network, console, errors, trace and other CDP tools are refused with an error naming the command and either `workaround: eval` or `no workaround on WebDriver`.
 
 `--proxy`, `--headers`, `--user-agent`, `--state`, `--extension`, `--init-script`, `--enable`, `--download-path`, `--args`, `--color-scheme`, `--profile`, `--ca-cert`, and `--allowed-domains` are rejected because WebKit cannot apply them. Tabs, network interception, tracing, and other CDP features are not available. Headless webkit sessions are subject to the default idle timeout, unlike Safari and iOS.
 

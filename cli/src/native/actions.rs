@@ -5803,6 +5803,9 @@ where
     if spec.own_page_load {
         backend = backend.with_own_page_load();
     }
+    if spec.provider == "webkit" {
+        backend = backend.with_bulk_fill_over(webkit::BULK_FILL_OVER);
+    }
     state.webdriver_backend = Some(backend);
     state.webdriver_identity = Some(spec.identity);
     state.webdriver_stop_command = spec.stop_command;
@@ -5857,6 +5860,15 @@ async fn check_local_webdriver_alive(
         None => Err("no WebDriver session".to_string()),
     };
     probe.map_err(|e| {
+        // The process is alive (checked above) and the request merely timed
+        // out: the driver is busy (webkit-cli answers one request at a time),
+        // not gone, and closing would throw the session away for nothing.
+        if e.contains(super::webdriver::client::NO_ANSWER) {
+            return format!(
+                "{} WebDriver driver is busy: it is running but did not answer in time ({}). Retry in a few seconds",
+                provider, e
+            );
+        }
         format!(
             "{} WebDriver session is not responding ({}). {}",
             provider,
@@ -17501,6 +17513,146 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             "{}",
             click
         );
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    /// D7: on webkit, fill types up to 256 characters key by key and inserts
+    /// longer text in one step; `keyboard type` types into the focused element.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_webkit_fill_threshold_and_keyboard_type() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _launch, log) = launch_fake_webkit_with_limit(dir.path(), 5000).await;
+        let open = execute_command(
+            &json!({ "id": "o", "action": "navigate", "url": "http://ok.test/form" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(open["success"], true, "{}", open);
+        let entries = |log: &std::path::Path| -> Vec<String> {
+            std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .filter(|l| l.starts_with("value ") || l.starts_with("insert "))
+                .map(String::from)
+                .collect()
+        };
+
+        // 256 characters: typed, in chunks of 32.
+        let fill = execute_command(
+            &json!({ "id": "f", "action": "fill", "selector": "#t", "value": "a".repeat(256) }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(fill["success"], true, "{}", fill);
+        assert_eq!(entries(&log), vec!["value 32".to_string(); 8]);
+
+        // 12,000 characters: one insert replacing the content, no keys.
+        std::fs::write(&log, "").unwrap();
+        let started = std::time::Instant::now();
+        let fill = execute_command(
+            &json!({ "id": "f", "action": "fill", "selector": "#t", "value": "x".repeat(12_000) }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(fill["success"], true, "{}", fill);
+        assert_eq!(entries(&log), ["insert 12000 replace=True"]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let value = execute_command(
+            &json!({ "id": "v", "action": "inputvalue", "selector": "#t" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(value["data"]["value"], "x".repeat(12_000), "{}", value);
+
+        // keyboard type: keys into the focused element; inserttext: one insert.
+        std::fs::write(&log, "").unwrap();
+        let typed = execute_command(
+            &json!({ "id": "k", "action": "keyboard", "subaction": "type", "text": "hello" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(typed["success"], true, "{}", typed);
+        let inserted = execute_command(
+            &json!({ "id": "k", "action": "keyboard", "subaction": "insertText", "text": "abc" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(inserted["success"], true, "{}", inserted);
+        assert_eq!(entries(&log), ["value 5", "insert 3 replace=False"]);
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    /// D7: when typing outlives its limit, nothing more is sent, and the next
+    /// command says the driver is busy (retry), not that the session is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_webkit_type_stops_sending_after_its_limit() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        // Each driver call may take 1s; the fake's third chunk takes 3s.
+        let (mut state, launch, log) = launch_fake_webkit_with_limit(dir.path(), 1000).await;
+        let open = execute_command(
+            &json!({ "id": "o", "action": "navigate", "url": "http://slowtype.test/" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(open["success"], true, "{}", open);
+
+        let typed = execute_command(
+            &json!({ "id": "t", "action": "type", "selector": "#t", "text": "y".repeat(200) }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(typed["success"], false, "{}", typed);
+        let error = typed["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("Typing stopped after 64 of 200 characters"),
+            "{}",
+            error
+        );
+        assert!(error.contains("Nothing more is sent"), "{}", error);
+
+        // The next command (the CLI sends launch first) is told to retry.
+        let next = execute_command(&launch, &mut state).await;
+        assert_eq!(next["success"], false, "{}", next);
+        let busy = next["error"].as_str().unwrap();
+        assert!(busy.contains("busy typing"), "{}", busy);
+        assert!(busy.contains("Retry"), "{}", busy);
+        assert!(
+            !busy.contains("close"),
+            "a busy driver needs no close: {}",
+            busy
+        );
+
+        // Once the chunk in flight is done the session is usable, and no
+        // further chunk was ever sent.
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        let next = execute_command(&launch, &mut state).await;
+        assert_eq!(next["success"], true, "{}", next);
+        let sent = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("value "))
+            .count();
+        assert_eq!(sent, 3, "typing must stop at the chunk that timed out");
         close_all_browser_backends(&mut state).await.unwrap();
     }
 

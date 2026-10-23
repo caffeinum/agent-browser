@@ -37,6 +37,12 @@ def now_ms():
     return time.time() * 1000.0
 
 
+def wd_log(line):
+    if os.environ.get("FAKE_WD_LOG"):
+        with open(os.environ["FAKE_WD_LOG"], "a") as f:
+            f.write(line + "\n")
+
+
 # "origin" is the current document's performance.timeOrigin: when the
 # navigation that produced it started (not when it committed).
 state = {"url": "about:blank", "sessions": 0, "origin": now_ms(), "navs": []}
@@ -108,6 +114,13 @@ def execute(script, args=()):
             "now": now_ms(),
             "redirected": False,
         }
+    if "execCommand('insertText'" in script:
+        # One-step insert (fill over the threshold, keyboard inserttext).
+        wd_log("insert %d replace=%s" % (len(args[1]), args[2]))
+        state["typed"] = args[1] if args[2] else state.get("typed", "") + args[1]
+        return {"trusted": True}
+    if "document.activeElement" in script:
+        return ELEMENT
     if "elementFromPoint" in script:
         # The covered-click description on a "covered.test" page.
         return {
@@ -189,6 +202,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/session/%s/execute/sync" % sid:
             return self.reply(execute(data["script"], data.get("args", [])))
         if self.path == "/session/%s/element/el-7/value" % sid:
+            wd_log("value %d" % len(data["text"]))
+            state["value_calls"] = state.get("value_calls", 0) + 1
+            if "slowtype.test" in state["url"] and state["value_calls"] == 3:
+                # The third chunk takes 3s to type: longer than the test's limit.
+                time.sleep(3)
             state["typed"] = state.get("typed", "") + data["text"]
             return self.reply(None)
         if self.path == "/session/%s/element/el-7/clear" % sid:

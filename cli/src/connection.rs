@@ -1206,8 +1206,26 @@ fn has_os_error(error: &str, code: u32) -> bool {
 /// avoiding the daemon's spawn-time env snapshot drifting from the client.
 pub(crate) fn read_timeout_for(cmd: &Value) -> Duration {
     let mut op_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0);
-    if cmd.get("action").and_then(Value::as_str) == Some("mousemove") {
-        op_ms = op_ms.max(cmd.get("duration").and_then(Value::as_u64).unwrap_or(0));
+    match cmd.get("action").and_then(Value::as_str) {
+        Some("mousemove") => {
+            op_ms = op_ms.max(cmd.get("duration").and_then(Value::as_u64).unwrap_or(0));
+        }
+        // Key-by-key typing on a WebDriver session is bounded by a budget
+        // that grows with the text; wait at least that long for the answer.
+        Some("type" | "fill" | "keyboard") => {
+            let text = cmd
+                .get("text")
+                .or_else(|| cmd.get("value"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let chars = text.chars().count() as u64;
+            let delay = cmd.get("delay").and_then(Value::as_u64).unwrap_or(0);
+            op_ms = op_ms.max(
+                crate::native::webdriver::typing_budget_ms(chars as usize)
+                    .saturating_add(delay.saturating_mul(chars)),
+            );
+        }
+        _ => {}
     }
     Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
 }
@@ -1453,6 +1471,20 @@ mod tests {
         assert!(!is_read_only(&json!({"action": "evaluate"})));
         assert!(!is_read_only(&json!({"action": "some_future_action"})));
         assert!(!is_read_only(&json!({})));
+    }
+
+    #[test]
+    fn long_typing_gets_the_typing_budget() {
+        // 20s + 20ms x 2000 = 60s, plus the 10s margin.
+        let text = "x".repeat(2000);
+        assert_eq!(
+            read_timeout_for(&json!({"action": "type", "text": text})),
+            Duration::from_secs(70)
+        );
+        assert_eq!(
+            read_timeout_for(&json!({"action": "fill", "value": "hi"})),
+            Duration::from_millis(30_040)
+        );
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("clear", ""),
     ("hover", "hover"),
     ("dblclick", "dblclick"),
+    ("keyboard", "keyboard type"),
 ];
 
 const POLL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -53,16 +54,32 @@ pub async fn execute(
             if cmd.get("clear").and_then(Value::as_bool).unwrap_or(false) {
                 wb.clear_element(&el).await?;
             }
-            match cmd.get("delay").and_then(Value::as_u64) {
-                Some(delay) if delay > 0 => {
-                    for ch in text.chars() {
-                        wb.send_keys(&el, &ch.to_string()).await?;
-                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                    }
-                }
-                _ => wb.send_keys(&el, text).await?,
-            }
+            let delay = cmd
+                .get("delay")
+                .and_then(Value::as_u64)
+                .filter(|d| *d > 0)
+                .map(std::time::Duration::from_millis);
+            wb.type_text(&el, text, delay).await?;
             Ok(json!({ "typed": text }))
+        }
+        "keyboard" => {
+            // Into whatever has focus, like Chrome's keyboard type/inserttext.
+            let text = required(cmd, "text")?;
+            let el = wb.focused_element().await?;
+            match cmd.get("subaction").and_then(Value::as_str) {
+                Some("type") => {
+                    wb.type_text(&el, text, None).await?;
+                    Ok(json!({ "typed": text }))
+                }
+                Some("insertText") => {
+                    wb.insert_text(&el, text, false).await?;
+                    Ok(json!({ "inserted": text }))
+                }
+                other => Err(format!(
+                    "keyboard {} is not supported on WebDriver; use keyboard type or keyboard inserttext",
+                    other.unwrap_or("(none)")
+                )),
+            }
         }
         "press" => {
             let key = required(cmd, "key")?;

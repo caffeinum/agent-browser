@@ -183,6 +183,28 @@ impl WebDriverClient {
         Ok(())
     }
 
+    /// Element Send Keys bounded by `limit` instead of the command limit.
+    pub async fn send_keys_within(
+        &self,
+        element_id: &str,
+        text: &str,
+        limit: Duration,
+    ) -> Result<(), String> {
+        let sid = self.session_id()?.to_string();
+        http_request(
+            "POST",
+            &format!(
+                "{}/session/{}/element/{}/value",
+                self.base_url, sid, element_id
+            ),
+            Some(&json!({ "text": text })),
+            Some(limit),
+        )
+        .await?
+        .into_value()?;
+        Ok(())
+    }
+
     pub async fn clear_element(&self, element_id: &str) -> Result<(), String> {
         let sid = self.session_id()?.to_string();
         self.post(
