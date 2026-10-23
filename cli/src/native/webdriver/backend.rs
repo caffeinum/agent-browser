@@ -578,11 +578,12 @@ impl WebDriverBackend {
             Some((sent, total)) => format!(" after {} of {} characters", sent, total),
             None => String::new(),
         };
-        // The driver stopped at its deadline and dropped the keys it had
-        // not sent; it stays usable.
+        // The driver stopped sending keys at its deadline; it stays usable.
+        // Keys it already posted to the page (one batch, at most 16 on
+        // webkit-cli 0.7.1) can still arrive after it answers.
         if error.starts_with("WebDriver timeout ") {
             return format!(
-                "Typing stopped{}: it did not finish within {}s, and {} dropped the keys it had not sent, so nothing more is typed. Check the field's value before typing the rest; for long text use fill",
+                "Typing stopped{}: it did not finish within {}s, and {} stopped sending keys; up to one batch (16 keys or fewer) already sent may still arrive. Wait a moment and check the field's value before typing the rest; for long text use fill",
                 typed,
                 budget.as_secs_f32(),
                 self.label

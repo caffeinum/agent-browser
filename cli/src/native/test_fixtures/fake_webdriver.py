@@ -225,8 +225,8 @@ class Handler(BaseHTTPRequestHandler):
                 with open(os.environ["FAKE_WD_LOG"], "a") as log:
                     log.write("actions %s\n" % json.dumps(data, sort_keys=True))
             if "slowtype.test" in state["url"]:
-                # webkit-cli 0.7.1 at the session script timeout: it stops,
-                # drops the keys it has not sent and answers `timeout`.
+                # webkit-cli 0.7.1 at the session script timeout: it stops
+                # sending keys and answers `timeout`.
                 return self.reply(
                     {"error": "timeout", "message": "input stopped: the request timed out or its client hung up"},
                     500,

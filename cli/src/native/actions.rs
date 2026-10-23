@@ -17660,7 +17660,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert_eq!(typed["success"], false, "{}", typed);
         assert_eq!(
             typed["error"],
-            "Typing stopped: it did not finish within 24s, and webkit-cli dropped the keys it had not sent, so nothing more is typed. Check the field's value before typing the rest; for long text use fill"
+            "Typing stopped: it did not finish within 24s, and webkit-cli stopped sending keys; up to one batch (16 keys or fewer) already sent may still arrive. Wait a moment and check the field's value before typing the rest; for long text use fill"
         );
         let next = execute_command(&launch, &mut state).await;
         assert_eq!(next["success"], true, "{}", next);
