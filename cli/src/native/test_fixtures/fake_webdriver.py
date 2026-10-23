@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 args = sys.argv[1:]
 if args[:1] == ["--version"]:
-    print(os.environ.get("FAKE_WD_VERSION", "webkit-cli 0.7.1"))
+    print(os.environ.get("FAKE_WD_VERSION", "webkit-cli 0.7.2"))
     sys.exit(0)
 if args[:1] == ["stop"]:
     # `webkit-cli stop --account NAME`
@@ -114,6 +114,9 @@ def execute(script, args=()):
             "now": now_ms(),
             "redirected": False,
         }
+    if "Array.from(v).length" in script:
+        # The field's text length in characters.
+        return len(state.get("typed", ""))
     if "document.activeElement" in script:
         return ELEMENT
     if "elementFromPoint" in script:
@@ -200,7 +203,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/session/%s/element/el-7/value" % sid:
             wd_log("value %d" % len(data["text"]))
             if "slowtype.test" in state["url"]:
-                # webkit-cli 0.7.0 past its input deadline: it typed part of
+                # webkit-cli at the session script timeout: it typed part of
                 # the text, dropped the rest and answers `timeout`.
                 state["typed"] = state.get("typed", "") + data["text"][:64]
                 return self.reply(
@@ -214,19 +217,25 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/session/%s/actions" % sid:
             state.setdefault("actions", []).append(data)
             # Key presses type into the (single) field, like a focused input.
+            # On "slowtype.test" only the first 64 keys land before the
+            # session script timeout stops input.
+            landed = 0
             for source in data.get("actions", []):
                 if source.get("type") != "key":
                     continue
                 for step in source.get("actions", []):
                     key = step.get("value", "")
                     if step.get("type") == "keyDown" and not ("" <= key <= ""):
+                        if "slowtype.test" in state["url"] and landed == 64:
+                            break
                         state["typed"] = state.get("typed", "") + key
+                        landed += 1
             if os.environ.get("FAKE_WD_LOG"):
                 with open(os.environ["FAKE_WD_LOG"], "a") as log:
                     log.write("actions %s\n" % json.dumps(data, sort_keys=True))
             if "slowtype.test" in state["url"]:
-                # webkit-cli 0.7.1 at the session script timeout: it stops
-                # sending keys and answers `timeout`.
+                # webkit-cli 0.7.2 at the session script timeout: the keys it
+                # posted have landed, the rest are dropped; it answers `timeout`.
                 return self.reply(
                     {"error": "timeout", "message": "input stopped: the request timed out or its client hung up"},
                     500,
