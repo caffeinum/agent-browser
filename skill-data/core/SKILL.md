@@ -496,6 +496,7 @@ EOF
 --json                  # JSON output (for machine parsing)
 --headed                # show the window (default is headless)
 --engine <name>         # chrome (default), lightpanda, obscura (experimental)
+-p webkit --webkit-account <name>  # macOS system WebKit via webkit-cli (see below)
 --webgpu                # enable WebGPU (software Vulkan on Linux, no GPU needed)
 --auto-connect          # connect to an already-running Chrome
 --cdp <port|url>        # connect to a CDP port or WebSocket URL; root query slash is optional
@@ -512,6 +513,15 @@ EOF
 ```
 
 Engine setup and limits: [Lightpanda](https://agent-browser.dev/engines/lightpanda), [Obscura (experimental)](https://agent-browser.dev/engines/obscura).
+
+## System WebKit (`-p webkit`)
+
+`agent-browser -p webkit --webkit-account <name> <command>` drives macOS system WebKit through webkit-cli 0.5.0+ (`webkit-cli create <name>` first). It keeps one webkit-cli per account across commands; `close` stops it.
+
+- Works: open, back, forward, reload, snapshot, click, fill, get text, get url, get title, eval, screenshot, cookies, close. `snapshot -i` output and `@eN` refs use the same format as Chrome.
+- Not supported (refused with an error naming the command; use `eval` instead): type, press, select, check, uncheck, scroll, wait, hover, focus, dblclick, get value/attr/html/count, is visible/enabled/checked, tabs, set viewport, upload, pdf, find, keyboard, network, console, errors, trace, and other CDP tools.
+- A slow page fails with `Navigation to <url> did not finish within <n>s`; the session stays usable.
+- Rejected options: --proxy, --headers, --user-agent, --state, --extension, --init-script, --enable, --download-path, --args, --color-scheme, --profile, --ca-cert, --allowed-domains.
 
 ## When to load another skill
 

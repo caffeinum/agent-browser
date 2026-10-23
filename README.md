@@ -1884,7 +1884,7 @@ agent-browser -p ios --device "John's iPhone" open https://example.com
 
 ### System WebKit (webkit-cli)
 
-Drive the macOS system WebKit headlessly through [webkit-cli](https://github.com/caffeinum/webkit-cli) 0.4.0 or later. agent-browser runs `webkit-cli webdriver --account <name>` and uses the WebDriver backend, so `snapshot`, `@ref` selectors, `click`, `fill`, and `get text` work as they do on Chrome.
+Drive the macOS system WebKit headlessly through [webkit-cli](https://github.com/caffeinum/webkit-cli) 0.5.0 or later (older versions are refused at launch). agent-browser runs `webkit-cli webdriver --account <name>` and uses the WebDriver backend, so `snapshot`, `@ref` selectors, `click`, `fill`, and `get text` work as they do on Chrome.
 
 ```bash
 webkit-cli create agent                                   # a dedicated webkit-cli account
@@ -1899,6 +1899,8 @@ agent-browser close                                       # stops webkit-cli for
 | --- | --- |
 | `AGENT_BROWSER_WEBKIT_ACCOUNT` | webkit-cli account (`--webkit-account` takes precedence). Required; there is no default, and a Chrome `--profile` is never used. |
 | `AGENT_BROWSER_WEBKIT_CLI` | Path to webkit-cli (`--executable-path` takes precedence; default: `webkit-cli` on PATH) |
+
+Supported commands: open, back, forward, reload, snapshot, click, fill, get text, get url, get title, eval, screenshot, cookies, close. Pages load with WebDriver's "eager" strategy (return once the DOM is ready). webkit-cli stops a page load at 80% of the command timeout (`AGENT_BROWSER_DEFAULT_TIMEOUT`, 25s by default, or `open --timeout`), and the command fails with `Navigation to <url> did not finish within <n>s`; the session stays usable. Every other command is refused by name: `<command> is not supported on -p webkit (WebDriver); supported: ...; workaround: eval`.
 
 Every command with the same account reuses one webkit-cli process and keeps the page. If webkit-cli exits, the next command fails with `webkit WebDriver driver exited`; run `agent-browser close`, then run the command again. `close` ends the session and runs `webkit-cli stop --account <name>`, so cookies are saved and nothing keeps running. Headless webkit sessions are subject to the default idle timeout.
 

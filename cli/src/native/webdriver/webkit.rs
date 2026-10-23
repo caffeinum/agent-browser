@@ -87,7 +87,7 @@ pub fn parse_version(output: &str) -> Option<(u64, u64, u64)> {
     let token = output
         .split_whitespace()
         .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
-    let mut parts = token.split(|c: char| c == '.' || c == '-' || c == '+');
+    let mut parts = token.split(['.', '-', '+']);
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);

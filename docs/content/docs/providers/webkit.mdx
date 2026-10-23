@@ -4,7 +4,7 @@ navTitle: "WebKit"
 description: "Drive macOS system WebKit headlessly through webkit-cli over WebDriver."
 ---
 
-The `webkit` provider drives the macOS system WebKit through [webkit-cli](https://github.com/caffeinum/webkit-cli) 0.4.0 or later. agent-browser runs `webkit-cli webdriver --account <name>` and talks to it over WebDriver. It is built in rather than a `browser.provider` plugin because plugins must return a CDP endpoint.
+The `webkit` provider drives the macOS system WebKit through [webkit-cli](https://github.com/caffeinum/webkit-cli) 0.5.0 or later; older versions are refused at launch. agent-browser runs `webkit-cli webdriver --account <name>` and talks to it over WebDriver. It is built in rather than a `browser.provider` plugin because plugins must return a CDP endpoint.
 
 ## Setup
 
@@ -36,6 +36,8 @@ If webkit-cli exits, the next command fails with `webkit WebDriver driver exited
 ## Supported commands
 
 `open`, `back`, `forward`, `reload`, `snapshot` (including `-i`, `-c`, `-d`, `-s`, and `--urls`), `click`, `fill`, and `get text` with `@ref` or CSS selectors, `get url`, `get title`, `eval`, `screenshot`, `read`, and cookie reads. Snapshots use the same format and refs as Chrome and are computed in the page from the DOM; iframe contents are not expanded. `get text` has the same 50000-character default cap.
+
+Pages load with WebDriver's "eager" strategy (return once the DOM is ready). webkit-cli stops a page load at 80% of the command timeout (`AGENT_BROWSER_DEFAULT_TIMEOUT`, 25s by default, or `open --timeout`), and the command fails with `Navigation to <url> did not finish within <n>s`; the session stays usable. Every other command is refused by name: `<command> is not supported on -p webkit (WebDriver); supported: ...; workaround: eval`.
 
 `--proxy`, `--headers`, `--user-agent`, `--state`, `--extension`, `--init-script`, `--enable`, `--download-path`, `--args`, `--color-scheme`, `--profile`, `--ca-cert`, and `--allowed-domains` are rejected because WebKit cannot apply them. Tabs, network interception, tracing, and other CDP features are not available. Headless webkit sessions are subject to the default idle timeout, unlike Safari and iOS.
 
