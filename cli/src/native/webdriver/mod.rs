@@ -10,9 +10,12 @@ pub mod safari;
 pub mod types;
 pub mod webkit;
 
-/// How long typing `chars` characters key by key may take on a WebDriver
-/// session: 20s plus 20ms a character (webkit-cli 0.6.0 measured 3-5ms).
-/// The CLI's read timeout for type/fill/keyboard uses the same budget.
+/// How long one type/fill/keyboard call may wait on a WebDriver session: 65s
+/// plus 20ms a character. The 65s base sits above webkit-cli 0.7.0's fixed
+/// 60s input deadline, so webkit-cli stops typing, drops the keys it has not
+/// sent and answers `timeout` before agent-browser gives up; a request
+/// abandoned earlier would keep typing (measured). The CLI's read timeout for
+/// these commands uses the same budget.
 pub fn typing_budget_ms(chars: usize) -> u64 {
-    20_000u64.saturating_add((chars as u64).saturating_mul(20))
+    65_000u64.saturating_add((chars as u64).saturating_mul(20))
 }

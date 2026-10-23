@@ -5803,9 +5803,6 @@ where
     if spec.own_page_load {
         backend = backend.with_own_page_load();
     }
-    if spec.provider == "webkit" {
-        backend = backend.with_bulk_fill_over(webkit::BULK_FILL_OVER);
-    }
     state.webdriver_backend = Some(backend);
     state.webdriver_identity = Some(spec.identity);
     state.webdriver_stop_command = spec.stop_command;
@@ -17148,7 +17145,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         ]);
         guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
-        guard.set("FAKE_WD_VERSION", "webkit-cli 0.5.0");
+        guard.set("FAKE_WD_VERSION", "webkit-cli 0.6.0");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("launches.log");
         let bin = fake_webkit_cli(dir.path(), &log);
@@ -17164,8 +17161,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         )
         .await
         .unwrap_err();
-        assert!(err.contains("webkit-cli 0.5.0"), "{}", err);
-        assert!(err.contains("needs 0.6.0 or later"), "{}", err);
+        assert!(err.contains("webkit-cli 0.6.0"), "{}", err);
+        assert!(err.contains("needs 0.7.0 or later"), "{}", err);
         assert!(!log.exists(), "an old webkit-cli must not be started");
     }
 
@@ -17516,11 +17513,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         close_all_browser_backends(&mut state).await.unwrap();
     }
 
-    /// D7: on webkit, fill types up to 256 characters key by key and inserts
-    /// longer text in one step; `keyboard type` types into the focused element.
+    /// D9: fill, type and keyboard send their text in one Element Send Keys
+    /// call at every length (webkit-cli 0.7.0 inserts long plain runs as one
+    /// trusted insertText); keyboard goes to the focused element.
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_webkit_fill_threshold_and_keyboard_type() {
+    async fn test_webkit_fill_and_keyboard_send_one_value_call() {
         if !python3_available() {
             return;
         }
@@ -17542,21 +17540,19 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             std::fs::read_to_string(log)
                 .unwrap()
                 .lines()
-                .filter(|l| l.starts_with("value ") || l.starts_with("insert "))
+                .filter(|l| l.starts_with("value "))
                 .map(String::from)
                 .collect()
         };
 
-        // 256 characters: typed, in chunks of 32.
         let fill = execute_command(
             &json!({ "id": "f", "action": "fill", "selector": "#t", "value": "a".repeat(256) }),
             &mut state,
         )
         .await;
         assert_eq!(fill["success"], true, "{}", fill);
-        assert_eq!(entries(&log), vec!["value 32".to_string(); 8]);
+        assert_eq!(entries(&log), ["value 256"]);
 
-        // 12,000 characters: one insert replacing the content, no keys.
         std::fs::write(&log, "").unwrap();
         let started = std::time::Instant::now();
         let fill = execute_command(
@@ -17565,7 +17561,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         )
         .await;
         assert_eq!(fill["success"], true, "{}", fill);
-        assert_eq!(entries(&log), ["insert 12000 replace=True"]);
+        assert_eq!(entries(&log), ["value 12000"]);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         let value = execute_command(
             &json!({ "id": "v", "action": "inputvalue", "selector": "#t" }),
@@ -17574,7 +17570,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         .await;
         assert_eq!(value["data"]["value"], "x".repeat(12_000), "{}", value);
 
-        // keyboard type: keys into the focused element; inserttext: one insert.
+        // keyboard type and inserttext: into the focused element.
         std::fs::write(&log, "").unwrap();
         let typed = execute_command(
             &json!({ "id": "k", "action": "keyboard", "subaction": "type", "text": "hello" }),
@@ -17588,15 +17584,16 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         )
         .await;
         assert_eq!(inserted["success"], true, "{}", inserted);
-        assert_eq!(entries(&log), ["value 5", "insert 3 replace=False"]);
+        assert_eq!(entries(&log), ["value 5", "value 3"]);
         close_all_browser_backends(&mut state).await.unwrap();
     }
 
-    /// D7: when typing outlives its limit, nothing more is sent, and the next
-    /// command says the driver is busy (retry), not that the session is gone.
+    /// D9: webkit-cli 0.7.0 stops typing at its input deadline, drops the
+    /// keys it has not sent and answers `timeout`; the error says nothing
+    /// more is typed, and the session stays usable (no busy state).
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_webkit_type_stops_sending_after_its_limit() {
+    async fn test_webkit_typing_stopped_by_the_driver_is_reported() {
         if !python3_available() {
             return;
         }
@@ -17607,8 +17604,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
         let dir = tempfile::tempdir().unwrap();
-        // Each driver call may take 1s; the fake's third chunk takes 3s.
-        let (mut state, launch, log) = launch_fake_webkit_with_limit(dir.path(), 1000).await;
+        let (mut state, launch, log) = launch_fake_webkit_with_limit(dir.path(), 5000).await;
         let open = execute_command(
             &json!({ "id": "o", "action": "navigate", "url": "http://slowtype.test/" }),
             &mut state,
@@ -17622,29 +17618,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         )
         .await;
         assert_eq!(typed["success"], false, "{}", typed);
-        let error = typed["error"].as_str().unwrap();
-        assert!(
-            error.starts_with("Typing stopped after 64 of 200 characters"),
-            "{}",
-            error
+        assert_eq!(
+            typed["error"],
+            "Typing did not finish: webkit-cli stopped at its input deadline and dropped the keys it had not sent, so nothing more is typed. Check the field's value before typing the rest"
         );
-        assert!(error.contains("Nothing more is sent"), "{}", error);
-
-        // The next command (the CLI sends launch first) is told to retry.
-        let next = execute_command(&launch, &mut state).await;
-        assert_eq!(next["success"], false, "{}", next);
-        let busy = next["error"].as_str().unwrap();
-        assert!(busy.contains("busy typing"), "{}", busy);
-        assert!(busy.contains("Retry"), "{}", busy);
-        assert!(
-            !busy.contains("close"),
-            "a busy driver needs no close: {}",
-            busy
-        );
-
-        // Once the chunk in flight is done the session is usable, and no
-        // further chunk was ever sent.
-        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
         let next = execute_command(&launch, &mut state).await;
         assert_eq!(next["success"], true, "{}", next);
         let sent = std::fs::read_to_string(&log)
@@ -17652,7 +17629,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             .lines()
             .filter(|l| l.starts_with("value "))
             .count();
-        assert_eq!(sent, 3, "typing must stop at the chunk that timed out");
+        assert_eq!(sent, 1, "one call, not retried");
         close_all_browser_backends(&mut state).await.unwrap();
     }
 

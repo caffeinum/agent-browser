@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 args = sys.argv[1:]
 if args[:1] == ["--version"]:
-    print(os.environ.get("FAKE_WD_VERSION", "webkit-cli 0.6.0"))
+    print(os.environ.get("FAKE_WD_VERSION", "webkit-cli 0.7.0"))
     sys.exit(0)
 if args[:1] == ["stop"]:
     # `webkit-cli stop --account NAME`
@@ -114,11 +114,6 @@ def execute(script, args=()):
             "now": now_ms(),
             "redirected": False,
         }
-    if "execCommand('insertText'" in script:
-        # One-step insert (fill over the threshold, keyboard inserttext).
-        wd_log("insert %d replace=%s" % (len(args[1]), args[2]))
-        state["typed"] = args[1] if args[2] else state.get("typed", "") + args[1]
-        return {"trusted": True}
     if "document.activeElement" in script:
         return ELEMENT
     if "elementFromPoint" in script:
@@ -203,10 +198,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(execute(data["script"], data.get("args", [])))
         if self.path == "/session/%s/element/el-7/value" % sid:
             wd_log("value %d" % len(data["text"]))
-            state["value_calls"] = state.get("value_calls", 0) + 1
-            if "slowtype.test" in state["url"] and state["value_calls"] == 3:
-                # The third chunk takes 3s to type: longer than the test's limit.
-                time.sleep(3)
+            if "slowtype.test" in state["url"]:
+                # webkit-cli 0.7.0 past its input deadline: it typed part of
+                # the text, dropped the rest and answers `timeout`.
+                state["typed"] = state.get("typed", "") + data["text"][:64]
+                return self.reply(
+                    {"error": "timeout", "message": "input stopped: the request timed out"}, 500
+                )
             state["typed"] = state.get("typed", "") + data["text"]
             return self.reply(None)
         if self.path == "/session/%s/element/el-7/clear" % sid:
