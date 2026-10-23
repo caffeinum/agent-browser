@@ -234,6 +234,55 @@ async fn e2e_dom_snapshot_style_lookups_stay_linear() {
     data(&execute_command(&json!({ "id": "9", "action": "close" }), &mut state).await);
 }
 
+/// `-i` prunes non-ref nodes in the page to keep the payload small; the
+/// rendered result must equal rendering the full walk in interactive mode.
+#[tokio::test]
+#[ignore]
+async fn e2e_dom_snapshot_interactive_pruning_changes_payload_not_output() {
+    let mut state = DaemonState::new();
+    open_html(
+        &mut state,
+        include_str!("test_fixtures/dom_snapshot_parity.html"),
+    )
+    .await;
+    let interactive = SnapshotOptions {
+        interactive: true,
+        ..Default::default()
+    };
+
+    let pruned_raw = eval(
+        &state,
+        &as_expression(&snapshot::dom_snapshot_script(&interactive)),
+    )
+    .await;
+    let full_raw = eval(
+        &state,
+        &as_expression(&snapshot::dom_snapshot_script(&SnapshotOptions::default())),
+    )
+    .await;
+    let pruned_nodes = pruned_raw["nodes"].as_array().unwrap().len();
+    let full_nodes = full_raw["nodes"].as_array().unwrap().len();
+    assert!(
+        pruned_nodes * 2 < full_nodes,
+        "pruning should drop most nodes: {} of {}",
+        pruned_nodes,
+        full_nodes
+    );
+
+    let pruned = snapshot::render_dom_snapshot(
+        snapshot::parse_dom_snapshot(pruned_raw).unwrap(),
+        &interactive,
+        &mut RefMap::new(),
+    );
+    let full = snapshot::render_dom_snapshot(
+        snapshot::parse_dom_snapshot(full_raw).unwrap(),
+        &interactive,
+        &mut RefMap::new(),
+    );
+    assert_eq!(normalize_refs(&pruned), normalize_refs(&full));
+    data(&execute_command(&json!({ "id": "9", "action": "close" }), &mut state).await);
+}
+
 #[test]
 fn normalize_refs_masks_ref_numbers_only() {
     assert_eq!(

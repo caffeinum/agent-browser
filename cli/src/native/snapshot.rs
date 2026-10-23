@@ -1491,6 +1491,11 @@ pub(crate) fn dom_snapshot_script(options: &SnapshotOptions) -> String {
         "key": dom_registry_key(),
         "selector": options.selector,
         "urls": options.urls,
+        // With -i the page sends only nodes that can take a ref, decided
+        // with the same role lists assign_refs uses.
+        "interactive": options.interactive,
+        "refRoles": INTERACTIVE_ROLES,
+        "namedRefRoles": CONTENT_ROLES,
     }))
 }
 
