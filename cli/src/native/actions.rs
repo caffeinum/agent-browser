@@ -621,7 +621,7 @@ impl SessionSetup {
 pub struct DaemonState {
     pub browser: Option<BrowserManager>,
     pub appium: Option<AppiumManager>,
-    pub safari_driver: Option<safari::SafariDriverProcess>,
+    pub webdriver_process: Option<super::webdriver::driver_process::DriverProcess>,
     pub webdriver_backend: Option<super::webdriver::backend::WebDriverBackend>,
     pub backend_type: BackendType,
     pub ref_map: RefMap,
@@ -776,7 +776,7 @@ impl DaemonState {
         Self {
             browser: None,
             appium: None,
-            safari_driver: None,
+            webdriver_process: None,
             webdriver_backend: None,
             backend_type: BackendType::Cdp,
             ref_map: RefMap::new(),
@@ -2656,10 +2656,10 @@ pub(crate) async fn close_all_browser_backends(state: &mut DaemonState) -> Resul
         let _ = appium.close().await;
     }
     state.appium = None;
-    if let Some(ref mut driver) = state.safari_driver {
-        driver.kill();
+    if let Some(ref mut driver) = state.webdriver_process {
+        driver.shutdown().await;
     }
-    state.safari_driver = None;
+    state.webdriver_process = None;
     state.backend_type = BackendType::Cdp;
 
     close_result
@@ -5528,7 +5528,7 @@ async fn launch_safari(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .port()
     };
 
-    let driver = safari::launch_safaridriver(actual_port)?;
+    let driver = safari::launch_safaridriver(actual_port).await?;
     let mut client = super::webdriver::client::WebDriverClient::new(actual_port);
 
     client
@@ -5537,7 +5537,7 @@ async fn launch_safari(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         }))
         .await?;
 
-    state.safari_driver = Some(driver);
+    state.webdriver_process = Some(driver);
     state.webdriver_backend = Some(WebDriverBackend::new(client));
     state.backend_type = BackendType::WebDriver;
     state.engine = "safari".to_string();

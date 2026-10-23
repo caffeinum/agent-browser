@@ -1,6 +1,7 @@
 pub mod appium;
 pub mod backend;
 pub mod client;
+pub mod driver_process;
 pub mod ios;
 pub mod safari;
 pub mod types;
