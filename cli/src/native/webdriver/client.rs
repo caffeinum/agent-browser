@@ -1,9 +1,33 @@
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// Marker in the error for a request the server never answered in time.
+pub const NO_ANSWER: &str = "did not answer";
+
+/// How long a WebDriver call may wait for its answer. Both stay below the
+/// CLI's 30s read timeout by default, so the daemon always answers first.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Limits {
+    pub command: Duration,
+    pub page_load: Duration,
+}
+
+impl Limits {
+    pub const fn uniform(limit: Duration) -> Self {
+        Self {
+            command: limit,
+            page_load: limit,
+        }
+    }
+}
+
+/// Matches the daemon's default command timeout (AGENT_BROWSER_DEFAULT_TIMEOUT).
+pub const DEFAULT_LIMITS: Limits = Limits::uniform(Duration::from_millis(25_000));
+
 pub struct WebDriverClient {
     base_url: String,
     session_id: Option<String>,
+    limits: Limits,
 }
 
 impl WebDriverClient {
@@ -11,7 +35,16 @@ impl WebDriverClient {
         Self {
             base_url: format!("http://127.0.0.1:{}", port),
             session_id: None,
+            limits: DEFAULT_LIMITS,
         }
+    }
+
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.limits = limits;
+    }
+
+    pub fn limits(&self) -> Limits {
+        self.limits
     }
 
     pub async fn create_session(&mut self, capabilities: Value) -> Result<Value, String> {
@@ -34,19 +67,51 @@ impl WebDriverClient {
         Ok(response)
     }
 
+    /// Best effort and briefly bounded: a busy driver must not hold up
+    /// close, which stops the driver process next anyway.
     pub async fn delete_session(&mut self) -> Result<(), String> {
         if let Some(ref sid) = self.session_id.clone() {
-            let _ = self.delete(&format!("/session/{}", sid)).await;
+            let url = format!("{}/session/{}", self.base_url, sid);
+            let _ = http_request("DELETE", &url, None, Some(Duration::from_secs(3))).await;
             self.session_id = None;
         }
         Ok(())
     }
 
     pub async fn navigate(&self, url: &str) -> Result<(), String> {
+        self.navigate_within(url, self.limits.page_load).await
+    }
+
+    pub async fn navigate_within(&self, url: &str, limit: Duration) -> Result<(), String> {
         let sid = self.session_id()?.to_string();
-        self.post(&format!("/session/{}/url", sid), &json!({ "url": url }))
-            .await?;
+        http_request(
+            "POST",
+            &format!("{}/session/{}/url", self.base_url, sid),
+            Some(&json!({ "url": url })),
+            Some(limit),
+        )
+        .await?
+        .into_value()?;
         Ok(())
+    }
+
+    /// GET the current URL with a short limit, to tell a busy driver from an
+    /// idle one without waiting out the normal command budget.
+    pub async fn probe_url(&self, limit: Duration) -> Result<String, String> {
+        let sid = self.session_id()?.to_string();
+        let response = http_request(
+            "GET",
+            &format!("{}/session/{}/url", self.base_url, sid),
+            None,
+            Some(limit),
+        )
+        .await?
+        .into_value()?;
+        Ok(response
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
     }
 
     pub async fn get_url(&self) -> Result<String, String> {
@@ -75,6 +140,7 @@ impl WebDriverClient {
             "POST",
             &format!("{}/session/{}/element", self.base_url, sid),
             Some(&json!({ "using": using, "value": value })),
+            Some(self.limits.command),
         )
         .await?;
         if !response.is_success() && response.w3c_error() == Some("no such element") {
@@ -181,6 +247,15 @@ impl WebDriverClient {
         Self {
             base_url: format!("http://127.0.0.1:{}", port),
             session_id: Some(session_id),
+            limits: DEFAULT_LIMITS,
+        }
+    }
+
+    fn limit_for(&self, method: &str, path: &str) -> Option<Duration> {
+        match Wait::for_request(method, path) {
+            Wait::Command => Some(self.limits.command),
+            Wait::PageLoad => Some(self.limits.page_load),
+            Wait::Unbounded => None,
         }
     }
 
@@ -197,21 +272,36 @@ impl WebDriverClient {
     }
 
     async fn get(&self, path: &str) -> Result<Value, String> {
-        http_request("GET", &format!("{}{}", self.base_url, path), None)
-            .await?
-            .into_value()
+        http_request(
+            "GET",
+            &format!("{}{}", self.base_url, path),
+            None,
+            self.limit_for("GET", path),
+        )
+        .await?
+        .into_value()
     }
 
     async fn post(&self, path: &str, body: &Value) -> Result<Value, String> {
-        http_request("POST", &format!("{}{}", self.base_url, path), Some(body))
-            .await?
-            .into_value()
+        http_request(
+            "POST",
+            &format!("{}{}", self.base_url, path),
+            Some(body),
+            self.limit_for("POST", path),
+        )
+        .await?
+        .into_value()
     }
 
     async fn delete(&self, path: &str) -> Result<Value, String> {
-        http_request("DELETE", &format!("{}{}", self.base_url, path), None)
-            .await?
-            .into_value()
+        http_request(
+            "DELETE",
+            &format!("{}{}", self.base_url, path),
+            None,
+            self.limit_for("DELETE", path),
+        )
+        .await?
+        .into_value()
     }
 }
 
@@ -248,10 +338,9 @@ pub(crate) fn element_id_from_value(
 /// How long one WebDriver round trip may take before it fails loudly.
 #[derive(Clone, Copy, Debug)]
 enum Wait {
-    /// Ordinary commands: a server that accepts and never answers is broken.
+    /// Ordinary commands.
     Command,
-    /// Navigation blocks on page load; W3C's default page-load timeout is
-    /// 300s, so allow a little more and let the driver report its own timeout.
+    /// Navigation, which blocks on page load.
     PageLoad,
     /// POST /session can boot a simulator or real device (Appium) and take
     /// minutes; an abandoned request would orphan the session it creates.
@@ -271,14 +360,6 @@ impl Wait {
             return Wait::PageLoad;
         }
         Wait::Command
-    }
-
-    fn limit(self) -> Option<Duration> {
-        match self {
-            Wait::Command => Some(Duration::from_secs(60)),
-            Wait::PageLoad => Some(Duration::from_secs(330)),
-            Wait::Unbounded => None,
-        }
     }
 }
 
@@ -349,6 +430,7 @@ async fn http_request(
     method: &str,
     url: &str,
     body: Option<&Value>,
+    limit: Option<Duration>,
 ) -> Result<HttpResponse, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("Invalid URL: {}", e))?;
     let host = parsed.host_str().unwrap_or("127.0.0.1");
@@ -390,14 +472,15 @@ async fn http_request(
 
     let mut response = Vec::new();
     let read = stream.read_to_end(&mut response);
-    match Wait::for_request(method, path).limit() {
+    match limit {
         Some(limit) => tokio::time::timeout(limit, read).await.map_err(|_| {
             format!(
-                "WebDriver server at {} did not answer {} {} within {}s",
+                "WebDriver server at {} {} {} {} within {}s",
                 addr,
+                NO_ANSWER,
                 method,
                 path,
-                limit.as_secs()
+                limit.as_secs_f32()
             )
         })?,
         None => read.await,
@@ -535,30 +618,37 @@ mod tests {
     }
 
     #[test]
-    fn test_session_creation_and_navigation_are_not_capped_at_command_wait() {
-        fn wait(m: &str, p: &str) -> Option<Duration> {
-            Wait::for_request(m, p).limit()
-        }
-        assert_eq!(wait("POST", "/session"), None);
+    fn test_limits_follow_the_endpoint_class() {
+        let mut client = WebDriverClient::new(1);
+        client.set_limits(Limits {
+            command: Duration::from_secs(7),
+            page_load: Duration::from_secs(9),
+        });
+        assert_eq!(client.limit_for("POST", "/session"), None);
         for nav in ["url", "back", "forward", "refresh"] {
             let path = format!("/session/abc/{}", nav);
-            assert!(
-                wait("POST", &path).unwrap() > Duration::from_secs(300),
+            assert_eq!(
+                client.limit_for("POST", &path),
+                Some(Duration::from_secs(9)),
                 "{}",
                 path
             );
         }
         assert_eq!(
-            wait("GET", "/session/abc/url"),
-            Some(Duration::from_secs(60))
+            client.limit_for("GET", "/session/abc/url"),
+            Some(Duration::from_secs(7))
         );
         assert_eq!(
-            wait("POST", "/session/abc/execute/sync"),
-            Some(Duration::from_secs(60))
+            client.limit_for("POST", "/session/abc/execute/sync"),
+            Some(Duration::from_secs(7))
         );
-        assert_eq!(
-            wait("DELETE", "/session/abc"),
-            Some(Duration::from_secs(60))
+        assert!(
+            DEFAULT_LIMITS.command < Duration::from_secs(30),
+            "must answer before the CLI gives up"
+        );
+        assert!(
+            DEFAULT_LIMITS.page_load < Duration::from_secs(30),
+            "must answer before the CLI gives up"
         );
     }
 

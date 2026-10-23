@@ -9,6 +9,7 @@ Each start appends "launch <account>" to $FAKE_WD_LOG when set.
 import json
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 args = sys.argv[1:]
@@ -87,13 +88,26 @@ class Handler(BaseHTTPRequestHandler):
             state["sid"] = sid
             return self.reply({"sessionId": sid, "capabilities": {"account": account}})
         sid = state.get("sid")
+        # Like webkit-cli, this server is single-threaded: while a load is
+        # pending, no other request is answered. "hang.test" never finishes
+        # loading, "slow.test" takes 2s, and on a "hang-later" page a click or
+        # back starts a load that never finishes.
         if self.path == "/session/%s/url" % sid:
+            if "hang.test" in data["url"]:
+                time.sleep(3600)
+            if "slow.test" in data["url"]:
+                time.sleep(2)
             state["url"] = data["url"]
             return self.reply(None)
         if self.path == "/session/%s/execute/sync" % sid:
             return self.reply(execute(data["script"]))
+        if self.path in ("/session/%s/element/el-7/click" % sid, "/session/%s/back" % sid):
+            if "hang-later" in state["url"]:
+                time.sleep(3600)
         if self.path == "/session/%s/element/el-7/click" % sid:
             state["clicks"] = state.get("clicks", 0) + 1
+            return self.reply(None)
+        if self.path == "/session/%s/back" % sid:
             return self.reply(None)
         return self.reply({"error": "unknown command", "message": self.path}, 404)
 

@@ -43,11 +43,81 @@ pub trait BrowserBackend: Send + Sync {
 /// WebDriver implementation of BrowserBackend
 pub struct WebDriverBackend {
     client: super::client::WebDriverClient,
+    /// Driver name used in messages ("webkit-cli", "safaridriver").
+    label: String,
+    /// What the driver is still loading after a navigation outlived its
+    /// limit. Drivers such as webkit-cli answer nothing else until it ends.
+    busy_loading: std::sync::Mutex<Option<String>>,
 }
+
+/// How long a command waits to learn whether a busy driver is free again.
+const BUSY_PROBE: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl WebDriverBackend {
     pub fn new(client: super::client::WebDriverClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            label: "WebDriver server".to_string(),
+            busy_loading: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn with_label(mut self, label: &str) -> Self {
+        self.label = label.to_string();
+        self
+    }
+
+    /// Fail fast while the driver is still loading a page that outlived its
+    /// limit, instead of queueing behind it until the CLI gives up.
+    pub async fn ensure_idle(&self) -> Result<(), String> {
+        let Some(target) = self.busy_loading.lock().map(|b| b.clone()).unwrap_or(None) else {
+            return Ok(());
+        };
+        match self.client.probe_url(BUSY_PROBE).await {
+            Ok(_) => {
+                if let Ok(mut busy) = self.busy_loading.lock() {
+                    *busy = None;
+                }
+                Ok(())
+            }
+            Err(_) => Err(format!(
+                "{} is still loading {}. Retry shortly, or run `agent-browser close` to abandon it",
+                self.label, target
+            )),
+        }
+    }
+
+    /// Run a page-loading call; when it outlives its limit, remember what is
+    /// loading and say so.
+    async fn loading<F>(&self, target: String, call: F) -> Result<(), String>
+    where
+        F: std::future::Future<Output = Result<(), String>>,
+    {
+        self.ensure_idle().await?;
+        match call.await {
+            Err(e) if e.contains(super::client::NO_ANSWER) => {
+                if let Ok(mut busy) = self.busy_loading.lock() {
+                    *busy = Some(target.clone());
+                }
+                Err(format!(
+                    "{} did not finish loading within {}s; {} is still loading it. Later commands fail until it finishes; `agent-browser close` abandons it",
+                    target,
+                    self.client.limits().page_load.as_secs_f32(),
+                    self.label
+                ))
+            }
+            other => other,
+        }
+    }
+
+    /// Navigate with an explicit page-load limit (a command's --timeout).
+    pub async fn navigate_within(
+        &self,
+        url: &str,
+        limit: std::time::Duration,
+    ) -> Result<(), String> {
+        self.loading(url.to_string(), self.client.navigate_within(url, limit))
+            .await
     }
 
     /// Evaluate `expression` like CDP Runtime.evaluate: the value of the last
@@ -115,8 +185,16 @@ impl WebDriverBackend {
         self.client.find_element("css selector", selector).await
     }
 
+    /// A click may start a navigation the driver waits for, so it is bounded
+    /// and tracked like one.
     pub async fn click_element(&self, element_id: &str) -> Result<(), String> {
-        self.client.click_element(element_id).await
+        self.ensure_idle().await?;
+        let target = match self.client.get_url().await {
+            Ok(url) => format!("the page opened by a click on {}", url),
+            Err(_) => "the page opened by a click".to_string(),
+        };
+        self.loading(target, self.client.click_element(element_id))
+            .await
     }
 
     pub async fn fill_element(&self, element_id: &str, value: &str) -> Result<(), String> {
@@ -128,7 +206,8 @@ impl WebDriverBackend {
 #[async_trait]
 impl BrowserBackend for WebDriverBackend {
     async fn navigate(&self, url: &str) -> Result<(), String> {
-        self.client.navigate(url).await
+        self.loading(url.to_string(), self.client.navigate(url))
+            .await
     }
 
     async fn get_url(&self) -> Result<String, String> {
@@ -153,7 +232,7 @@ impl BrowserBackend for WebDriverBackend {
 
     async fn click(&self, selector: &str) -> Result<(), String> {
         let element_id = self.client.find_element("css selector", selector).await?;
-        self.client.click_element(&element_id).await
+        self.click_element(&element_id).await
     }
 
     async fn fill(&self, selector: &str, value: &str) -> Result<(), String> {
@@ -167,15 +246,18 @@ impl BrowserBackend for WebDriverBackend {
     }
 
     async fn back(&self) -> Result<(), String> {
-        self.client.back().await
+        self.loading("the previous page".to_string(), self.client.back())
+            .await
     }
 
     async fn forward(&self) -> Result<(), String> {
-        self.client.forward().await
+        self.loading("the next page".to_string(), self.client.forward())
+            .await
     }
 
     async fn reload(&self) -> Result<(), String> {
-        self.client.refresh().await
+        self.loading("the reloaded page".to_string(), self.client.refresh())
+            .await
     }
 
     async fn get_cookies(&self) -> Result<Value, String> {
