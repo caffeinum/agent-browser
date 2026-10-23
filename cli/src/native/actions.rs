@@ -622,6 +622,9 @@ pub struct DaemonState {
     pub browser: Option<BrowserManager>,
     pub appium: Option<AppiumManager>,
     pub webdriver_process: Option<super::webdriver::driver_process::DriverProcess>,
+    /// Provider identity of the local WebDriver session (e.g. "safari"), used
+    /// to reuse it across `-p` commands instead of relaunching the driver.
+    pub webdriver_identity: Option<String>,
     pub webdriver_backend: Option<super::webdriver::backend::WebDriverBackend>,
     pub backend_type: BackendType,
     pub ref_map: RefMap,
@@ -777,6 +780,7 @@ impl DaemonState {
             browser: None,
             appium: None,
             webdriver_process: None,
+            webdriver_identity: None,
             webdriver_backend: None,
             backend_type: BackendType::Cdp,
             ref_map: RefMap::new(),
@@ -2647,7 +2651,12 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
 /// because Safari and iOS sessions live outside `state.browser`.
 pub(crate) async fn close_all_browser_backends(state: &mut DaemonState) -> Result<(), String> {
     let close_result = close_current_browser(state).await;
+    close_webdriver_backends(state).await;
+    close_result
+}
 
+/// End the WebDriver session and stop its driver (Safari, iOS).
+async fn close_webdriver_backends(state: &mut DaemonState) {
     if let Some(ref mut webdriver) = state.webdriver_backend {
         let _ = webdriver.close().await;
     }
@@ -2660,9 +2669,8 @@ pub(crate) async fn close_all_browser_backends(state: &mut DaemonState) -> Resul
         driver.shutdown().await;
     }
     state.webdriver_process = None;
+    state.webdriver_identity = None;
     state.backend_type = BackendType::Cdp;
-
-    close_result
 }
 
 async fn close_after_network_control_failure(
@@ -2937,7 +2945,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         } else if let Some(ref mut mgr) = state.browser {
             mgr.has_process_exited() || !mgr.is_connection_alive().await
         } else {
-            true
+            // A WebDriver provider (Safari, iOS) owns the session without a
+            // CDP browser; auto-launching Chrome would silently replace it.
+            state.webdriver_backend.is_none()
         }
     } else {
         false
@@ -3031,6 +3041,13 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     };
 
     if !skip_launch {
+        if let Some(report) = state
+            .webdriver_process
+            .as_mut()
+            .and_then(|driver| driver.exit_report())
+        {
+            return error_response(&id, &report);
+        }
         if needs_launch {
             lifecycle_relaunched_browser = restore_transition_closed_browser
                 || state.browser.is_some()
@@ -5508,50 +5525,98 @@ async fn launch_ios(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
 }
 
 async fn launch_safari(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let port: u16 = cmd
-        .get("port")
-        .and_then(|v| v.as_u64())
-        .map(|p| p as u16)
-        .unwrap_or(0);
-    let driver_port = if port > 0 { port } else { 0 };
+    let port = driver_port_from_command(cmd)?;
+    launch_local_webdriver(
+        state,
+        LocalWebDriver {
+            provider: "safari",
+            identity: "safari".to_string(),
+            engine: "safari",
+            capabilities: json!({ "browserName": "safari" }),
+        },
+        || safari::launch_safaridriver(port),
+    )
+    .await
+}
 
-    // Find a free port if none specified
-    let actual_port = if driver_port > 0 {
-        driver_port
-    } else {
-        // Use any available high port
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| format!("Failed to find free port: {}", e))?;
-        listener
-            .local_addr()
-            .map_err(|e| format!("Failed to get local address: {}", e))?
-            .port()
-    };
+fn driver_port_from_command(cmd: &Value) -> Result<u16, String> {
+    match cmd.get("port").and_then(|v| v.as_u64()) {
+        Some(port) if port > 0 => {
+            u16::try_from(port).map_err(|_| format!("Invalid WebDriver port: {}", port))
+        }
+        _ => super::webdriver::driver_process::pick_free_port(),
+    }
+}
 
-    let driver = safari::launch_safaridriver(actual_port).await?;
-    let mut client = super::webdriver::client::WebDriverClient::new(actual_port);
+struct LocalWebDriver {
+    provider: &'static str,
+    /// Provider plus anything that selects a different browser profile.
+    identity: String,
+    engine: &'static str,
+    capabilities: Value,
+}
 
-    client
-        .create_session(serde_json::json!({
-            "browserName": "safari",
-        }))
-        .await?;
+/// Launch a locally spawned WebDriver server, or reuse the live session when
+/// the same provider identity is already running. A CLI `-p` invocation sends
+/// a launch before every command, so relaunching would lose the page each
+/// time. Any other WebDriver session is shut down before the new driver
+/// starts, so two drivers never share one profile.
+async fn launch_local_webdriver<F, Fut>(
+    state: &mut DaemonState,
+    spec: LocalWebDriver,
+    spawn: F,
+) -> Result<Value, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+        Output = Result<super::webdriver::driver_process::DriverProcess, String>,
+    >,
+{
+    if local_webdriver_is_live(state, &spec.identity).await {
+        return Ok(json!({
+            "launched": true,
+            "reused": true,
+            "provider": spec.provider,
+            "backend": "webdriver",
+        }));
+    }
+    close_webdriver_backends(state).await;
+
+    let driver = spawn().await?;
+    let port = driver.port;
+    let mut client = super::webdriver::client::WebDriverClient::new(port);
+    client.create_session(spec.capabilities).await?;
 
     state.webdriver_process = Some(driver);
     state.webdriver_backend = Some(WebDriverBackend::new(client));
+    state.webdriver_identity = Some(spec.identity);
     state.backend_type = BackendType::WebDriver;
-    state.engine = "safari".to_string();
+    state.engine = spec.engine.to_string();
     write_engine_file(&state.session_id, &state.engine);
-    write_provider_file(&state.session_id, "safari");
+    write_provider_file(&state.session_id, spec.provider);
     write_extensions_file(&state.session_id);
     state.reset_input_state();
 
     Ok(json!({
         "launched": true,
-        "provider": "safari",
-        "port": actual_port,
+        "provider": spec.provider,
+        "port": port,
         "backend": "webdriver",
     }))
+}
+
+async fn local_webdriver_is_live(state: &mut DaemonState, identity: &str) -> bool {
+    if state.webdriver_identity.as_deref() != Some(identity) {
+        return false;
+    }
+    let driver_running = state
+        .webdriver_process
+        .as_mut()
+        .is_some_and(|driver| driver.exit_report().is_none());
+    match state.webdriver_backend {
+        Some(ref wb) if driver_running => wb.get_url().await.is_ok(),
+        _ => false,
+    }
 }
 
 async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -15639,6 +15704,196 @@ mod tests {
             !restarted_path.exists(),
             "failed preflight must not create the replacement output"
         );
+    }
+
+    fn attach_fake_webdriver_session(state: &mut DaemonState, port: u16) {
+        state.backend_type = BackendType::WebDriver;
+        state.webdriver_backend = Some(WebDriverBackend::new(
+            crate::native::webdriver::client::WebDriverClient::new_with_session(
+                port,
+                "test-session".to_string(),
+            ),
+        ));
+    }
+
+    #[cfg(unix)]
+    async fn spawn_fake_local_driver(
+        log: &std::path::Path,
+    ) -> Result<crate::native::webdriver::driver_process::DriverProcess, String> {
+        let port = crate::native::webdriver::driver_process::pick_free_port()?;
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/native/test_fixtures/fake_webdriver.py"
+        );
+        let script = format!(
+            "FAKE_WD_LOG={} exec python3 {} --port {}",
+            log.display(),
+            fixture,
+            port
+        );
+        crate::native::webdriver::driver_process::DriverProcess::spawn(
+            "fake-driver",
+            std::path::Path::new("/bin/sh"),
+            &["-c".to_string(), script],
+            port,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+    }
+
+    fn fake_local_spec(identity: &str) -> LocalWebDriver {
+        LocalWebDriver {
+            provider: "safari",
+            identity: identity.to_string(),
+            engine: "safari",
+            capabilities: json!({}),
+        }
+    }
+
+    /// A `-p` invocation sends launch before every command; the second launch
+    /// must keep the running driver and its page.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_local_webdriver_launch_twice_reuses_the_session() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("launches.log");
+        let mut state = DaemonState::new();
+
+        let first = launch_local_webdriver(&mut state, fake_local_spec("safari"), || {
+            spawn_fake_local_driver(&log)
+        })
+        .await
+        .unwrap();
+        assert!(first.get("reused").is_none(), "{}", first);
+        handle_navigate(&json!({ "url": "https://example.com/kept" }), &mut state)
+            .await
+            .unwrap();
+
+        let second = launch_local_webdriver(&mut state, fake_local_spec("safari"), || {
+            spawn_fake_local_driver(&log)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(second["reused"], true, "{}", second);
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+        assert_eq!(
+            handle_url(&state).await.unwrap()["url"],
+            "https://example.com/kept"
+        );
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    /// A different identity replaces the session, and the old driver is
+    /// stopped before the new one starts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_local_webdriver_new_identity_stops_old_driver_first() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("launches.log");
+        let mut state = DaemonState::new();
+        launch_local_webdriver(&mut state, fake_local_spec("one"), || {
+            spawn_fake_local_driver(&log)
+        })
+        .await
+        .unwrap();
+        let old_port = state.webdriver_process.as_ref().unwrap().port;
+
+        let old_alive_at_spawn = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let probe = old_alive_at_spawn.clone();
+        let log_for_spawn = log.clone();
+        launch_local_webdriver(&mut state, fake_local_spec("two"), || async move {
+            let alive = tokio::net::TcpStream::connect(("127.0.0.1", old_port))
+                .await
+                .is_ok();
+            probe.store(alive, std::sync::atomic::Ordering::SeqCst);
+            spawn_fake_local_driver(&log_for_spawn).await
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            !old_alive_at_spawn.load(std::sync::atomic::Ordering::SeqCst),
+            "old driver must be stopped before the new one spawns"
+        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+        assert_eq!(state.webdriver_identity.as_deref(), Some("two"));
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_webdriver_session_is_not_replaced_by_chrome_auto_launch() {
+        let (port, server) = start_webdriver_response_server(vec![(
+            "/session/test-session/url",
+            json!({ "value": "https://example.com/webdriver" }),
+        )])
+        .await;
+        let mut state = DaemonState::new();
+        attach_fake_webdriver_session(&mut state, port);
+
+        let resp = execute_command(&json!({ "id": "u", "action": "url" }), &mut state).await;
+
+        assert_eq!(resp["success"], true, "{}", resp);
+        assert_eq!(resp["data"]["url"], "https://example.com/webdriver");
+        assert!(state.browser.is_none(), "no Chrome may be auto-launched");
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_exited_webdriver_driver_fails_loudly() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let port = crate::native::webdriver::driver_process::pick_free_port().unwrap();
+        let script = format!(
+            "python3 -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((\"127.0.0.1\",{})); s.listen(); time.sleep(0.5); sys.stderr.write(\"driver crashed\\n\"); sys.exit(3)'",
+            port
+        );
+        let driver = crate::native::webdriver::driver_process::DriverProcess::spawn(
+            "fake-driver",
+            std::path::Path::new("/bin/sh"),
+            &["-c".to_string(), script],
+            port,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let mut state = DaemonState::new();
+        attach_fake_webdriver_session(&mut state, port);
+        state.webdriver_process = Some(driver);
+
+        let resp = execute_command(&json!({ "id": "u", "action": "url" }), &mut state).await;
+
+        assert_eq!(resp["success"], false, "{}", resp);
+        let error = resp["error"].as_str().unwrap();
+        assert!(
+            error.contains("fake-driver WebDriver driver exited"),
+            "{}",
+            error
+        );
+        assert!(error.contains("run launch again"), "{}", error);
+        assert!(error.contains("driver crashed"), "{}", error);
+        assert!(state.browser.is_none());
     }
 
     #[tokio::test]

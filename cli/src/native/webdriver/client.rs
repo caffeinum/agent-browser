@@ -71,14 +71,17 @@ impl WebDriverClient {
 
     pub async fn find_element(&self, using: &str, value: &str) -> Result<String, String> {
         let sid = self.session_id()?.to_string();
-        let response = self
-            .post(
-                &format!("/session/{}/element", sid),
-                &json!({ "using": using, "value": value }),
-            )
-            .await?;
-
-        let element_value = response.get("value").ok_or("No element in response")?;
+        let response = http_request(
+            "POST",
+            &format!("{}/session/{}/element", self.base_url, sid),
+            Some(&json!({ "using": using, "value": value })),
+        )
+        .await?;
+        if !response.is_success() && response.w3c_error() == Some("no such element") {
+            return Err(format!("No element found by {} '{}'", using, value));
+        }
+        let body = response.into_value()?;
+        let element_value = body.get("value").ok_or("No element in response")?;
         element_id_from_value(element_value, using, value)
     }
 
@@ -194,15 +197,21 @@ impl WebDriverClient {
     }
 
     async fn get(&self, path: &str) -> Result<Value, String> {
-        http_request("GET", &format!("{}{}", self.base_url, path), None).await
+        http_request("GET", &format!("{}{}", self.base_url, path), None)
+            .await?
+            .into_value()
     }
 
     async fn post(&self, path: &str, body: &Value) -> Result<Value, String> {
-        http_request("POST", &format!("{}{}", self.base_url, path), Some(body)).await
+        http_request("POST", &format!("{}{}", self.base_url, path), Some(body))
+            .await?
+            .into_value()
     }
 
     async fn delete(&self, path: &str) -> Result<Value, String> {
-        http_request("DELETE", &format!("{}{}", self.base_url, path), None).await
+        http_request("DELETE", &format!("{}{}", self.base_url, path), None)
+            .await?
+            .into_value()
     }
 }
 
@@ -236,7 +245,111 @@ fn element_id_from_value(
         .ok_or("No element ID in response".to_string())
 }
 
-async fn http_request(method: &str, url: &str, body: Option<&Value>) -> Result<Value, String> {
+/// How long one WebDriver round trip may take before it fails loudly.
+#[derive(Clone, Copy, Debug)]
+enum Wait {
+    /// Ordinary commands: a server that accepts and never answers is broken.
+    Command,
+    /// Navigation blocks on page load; W3C's default page-load timeout is
+    /// 300s, so allow a little more and let the driver report its own timeout.
+    PageLoad,
+    /// POST /session can boot a simulator or real device (Appium) and take
+    /// minutes; an abandoned request would orphan the session it creates.
+    Unbounded,
+}
+
+impl Wait {
+    fn for_request(method: &str, path: &str) -> Self {
+        if method != "POST" {
+            return Wait::Command;
+        }
+        if path == "/session" {
+            return Wait::Unbounded;
+        }
+        let page_load = ["/url", "/back", "/forward", "/refresh"];
+        if path.starts_with("/session/") && page_load.iter().any(|suffix| path.ends_with(suffix)) {
+            return Wait::PageLoad;
+        }
+        Wait::Command
+    }
+
+    fn limit(self) -> Option<Duration> {
+        match self {
+            Wait::Command => Some(Duration::from_secs(60)),
+            Wait::PageLoad => Some(Duration::from_secs(330)),
+            Wait::Unbounded => None,
+        }
+    }
+}
+
+struct HttpResponse {
+    status: u16,
+    body: Value,
+}
+
+impl HttpResponse {
+    fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    fn w3c_error(&self) -> Option<&str> {
+        self.body
+            .get("value")
+            .and_then(|v| v.get("error"))
+            .and_then(Value::as_str)
+    }
+
+    /// The HTTP status decides success, never the payload shape: a script
+    /// may legitimately return `{"error": ...}` as page data.
+    fn into_value(self) -> Result<Value, String> {
+        if self.is_success() {
+            return Ok(self.body);
+        }
+        let message = self
+            .body
+            .get("value")
+            .and_then(|v| v.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        Err(match self.w3c_error() {
+            Some(error) => format!("WebDriver {} (HTTP {}): {}", error, self.status, message),
+            None => format!("WebDriver HTTP {}: {}", self.status, self.body),
+        })
+    }
+}
+
+fn decode_chunked(mut rest: &str) -> Result<String, String> {
+    let mut out = String::new();
+    loop {
+        let (size_line, after) = rest.split_once("\r\n").unwrap_or((rest, ""));
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|_| format!("Malformed chunk size {:?}", size_line))?;
+        if size == 0 {
+            return Ok(out);
+        }
+        let chunk = after
+            .get(..size)
+            .ok_or("Truncated chunked WebDriver response")?;
+        out.push_str(chunk);
+        rest = after[size..].trim_start_matches("\r\n");
+    }
+}
+
+fn parse_status_line(head: &str) -> Result<u16, String> {
+    let line = head.lines().next().unwrap_or("");
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .filter(|_| line.starts_with("HTTP/"))
+        .ok_or_else(|| format!("Malformed WebDriver HTTP status line: {:?}", line))
+}
+
+async fn http_request(
+    method: &str,
+    url: &str,
+    body: Option<&Value>,
+) -> Result<HttpResponse, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("Invalid URL: {}", e))?;
     let host = parsed.host_str().unwrap_or("127.0.0.1");
     let port = parsed.port().unwrap_or(80);
@@ -276,43 +389,49 @@ async fn http_request(method: &str, url: &str, body: Option<&Value>) -> Result<V
         .map_err(|e| format!("Write failed: {}", e))?;
 
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .map_err(|e| format!("Read failed: {}", e))?;
+    let read = stream.read_to_end(&mut response);
+    match Wait::for_request(method, path).limit() {
+        Some(limit) => tokio::time::timeout(limit, read).await.map_err(|_| {
+            format!(
+                "WebDriver server at {} did not answer {} {} within {}s",
+                addr,
+                method,
+                path,
+                limit.as_secs()
+            )
+        })?,
+        None => read.await,
+    }
+    .map_err(|e| format!("Read failed: {}", e))?;
 
     let response_str = String::from_utf8_lossy(&response);
-    let body_part = response_str.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+    let (head, body_part) = response_str
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("Malformed WebDriver HTTP response from {} {}", method, path))?;
+    let status = parse_status_line(head)?;
+    let body_part = body_part.trim();
 
-    // Handle chunked encoding
-    let json_body = if body_part.contains('\n')
-        && body_part
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_hexdigit())
-            .unwrap_or(false)
+    let json_body = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
     {
-        // Chunked: skip chunk size lines
-        body_part
-            .lines()
-            .filter(|l| !l.chars().all(|c| c.is_ascii_hexdigit() || c == '\r'))
-            .collect::<Vec<&str>>()
-            .join("")
+        decode_chunked(body_part)?
     } else {
         body_part.to_string()
     };
 
-    if json_body.is_empty() {
-        return Ok(json!({}));
-    }
-
-    serde_json::from_str(&json_body).map_err(|e| {
-        format!(
-            "Invalid JSON response: {} (body: {})",
-            e,
-            json_body.chars().take(100).collect::<String>()
-        )
-    })
+    let body = if json_body.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&json_body).map_err(|e| {
+            format!(
+                "Invalid JSON response: {} (body: {})",
+                e,
+                json_body.chars().take(100).collect::<String>()
+            )
+        })?
+    };
+    Ok(HttpResponse { status, body })
 }
 
 #[cfg(test)]
@@ -353,6 +472,113 @@ mod tests {
         let err = element_id_from_value(&payload, "css selector", ".missing")
             .expect_err("an error payload is a miss, not an element");
         assert_eq!(err, "No element found by css selector '.missing'");
+    }
+
+    async fn serve_once(status_line: &'static str, body: &'static str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status_line,
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        port
+    }
+
+    /// A page script may return data shaped like an error; only the HTTP
+    /// status says whether WebDriver failed.
+    #[tokio::test]
+    async fn test_script_result_shaped_like_an_error_is_data() {
+        let port = serve_once(
+            "HTTP/1.1 200 OK",
+            r#"{"value":{"error":"not_found","message":"page data"}}"#,
+        )
+        .await;
+        let client = WebDriverClient::new_with_session(port, "s".to_string());
+        let value = client.execute_script("return x", vec![]).await.unwrap();
+        assert_eq!(
+            value,
+            json!({ "error": "not_found", "message": "page data" })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_error_status_fails_with_w3c_message() {
+        let port = serve_once(
+            "HTTP/1.1 500 Internal Server Error",
+            r#"{"value":{"error":"javascript error","message":"boom"}}"#,
+        )
+        .await;
+        let client = WebDriverClient::new_with_session(port, "s".to_string());
+        let err = client.execute_script("throw 1", vec![]).await.unwrap_err();
+        assert_eq!(err, "WebDriver javascript error (HTTP 500): boom");
+    }
+
+    #[tokio::test]
+    async fn test_no_such_element_status_is_a_locator_miss() {
+        let port = serve_once(
+            "HTTP/1.1 404 Not Found",
+            r#"{"value":{"error":"no such element","message":"gone"}}"#,
+        )
+        .await;
+        let client = WebDriverClient::new_with_session(port, "s".to_string());
+        let err = client.find_element("css selector", "#x").await.unwrap_err();
+        assert_eq!(err, "No element found by css selector '#x'");
+    }
+
+    #[test]
+    fn test_session_creation_and_navigation_are_not_capped_at_command_wait() {
+        fn wait(m: &str, p: &str) -> Option<Duration> {
+            Wait::for_request(m, p).limit()
+        }
+        assert_eq!(wait("POST", "/session"), None);
+        for nav in ["url", "back", "forward", "refresh"] {
+            let path = format!("/session/abc/{}", nav);
+            assert!(
+                wait("POST", &path).unwrap() > Duration::from_secs(300),
+                "{}",
+                path
+            );
+        }
+        assert_eq!(
+            wait("GET", "/session/abc/url"),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            wait("POST", "/session/abc/execute/sync"),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            wait("DELETE", "/session/abc"),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn test_chunked_body_is_decoded() {
+        assert_eq!(
+            decode_chunked("5\r\n{\"val\r\n6\r\nue\":1}\r\n0").unwrap(),
+            "{\"value\":1}"
+        );
+        assert!(decode_chunked("zz\r\nabc").is_err());
+        assert!(decode_chunked("10\r\nabc").is_err());
+    }
+
+    #[test]
+    fn test_malformed_status_line_is_rejected() {
+        assert_eq!(
+            parse_status_line("HTTP/1.1 404 Not Found\r\nX: y").unwrap(),
+            404
+        );
+        assert!(parse_status_line("garbage").is_err());
     }
 
     #[test]
