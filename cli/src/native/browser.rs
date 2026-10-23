@@ -246,6 +246,11 @@ pub fn to_ai_friendly_error(error: &str) -> String {
             "{detail}. Verify the selector, role, or name is correct and the element exists in the DOM."
         );
     }
+    // Already specific (WebDriver's covered-click error names the target and
+    // the covering element, whose text may contain any of the words below).
+    if lower.starts_with("click on ") && lower.contains(" is covering it") {
+        return error.to_string();
+    }
     if lower.contains("strict mode violation") {
         return "Element matched multiple results. Use a more specific selector.".to_string();
     }

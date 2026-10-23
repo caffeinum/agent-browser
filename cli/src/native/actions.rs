@@ -41,7 +41,9 @@ use super::stream::{self, IdleActivity, StreamServer};
 use super::tab_binding;
 use super::tracing::{self as native_tracing, TracingState};
 use super::webdriver::appium::AppiumManager;
-use super::webdriver::backend::{unsupported_on_webdriver, BrowserBackend, WebDriverBackend};
+use super::webdriver::backend::{
+    refused_input_on_webkit, unsupported_on_webdriver, BrowserBackend, WebDriverBackend,
+};
 use super::webdriver::ios;
 use super::webdriver::safari;
 use super::webdriver::webkit;
@@ -3164,8 +3166,14 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     // instead of a CDP handler failing with "Browser not launched" or
     // returning an empty result.
     if state.browser.is_none() && state.webdriver_backend.is_some() && !skip_launch {
-        if let Some(error) = unsupported_on_webdriver(action, &state.webdriver_provider_name()) {
+        let provider = state.webdriver_provider_name();
+        if let Some(error) = unsupported_on_webdriver(action, &provider) {
             return error_response(&id, &error);
+        }
+        if provider == "webkit" {
+            if let Some(error) = refused_input_on_webkit(action, cmd) {
+                return error_response(&id, &error);
+            }
         }
     }
 
@@ -3225,7 +3233,6 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     let result = match action {
         _ if webdriver_page_command => {
             let timeout_ms = state.timeout_ms(cmd);
-            let provider = state.webdriver_provider_name();
             match state.webdriver_backend {
                 Some(ref wb) => {
                     super::webdriver::commands::execute(
@@ -3235,7 +3242,6 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                         &state.ref_map,
                         timeout_ms,
                         route_url_matches,
-                        &provider,
                     )
                     .await
                 }
@@ -17077,7 +17083,9 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
         let dir = tempfile::tempdir().unwrap();
-        let (mut state, _launch, _log) = launch_fake_webkit_with_limit(dir.path(), 1000).await;
+        // The driver's pageLoad is 80% of the 3s limit: 2.4s, 0.6s before the
+        // backstop (room for a loaded test machine).
+        let (mut state, _launch, _log) = launch_fake_webkit_with_limit(dir.path(), 3000).await;
 
         let started = std::time::Instant::now();
         let open = execute_command(
@@ -17088,10 +17096,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert_eq!(open["success"], false, "{}", open);
         assert_eq!(
             open["error"],
-            "Navigation to http://deadline.test/ did not finish within 0.8s; the page may be partly loaded"
+            "Navigation to http://deadline.test/ did not finish within 2.4s; the page may be partly loaded"
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(1000),
+            started.elapsed() < std::time::Duration::from_millis(3000),
             "driver timeout must come before the backstop"
         );
 
@@ -17128,7 +17136,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         ]);
         guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
-        guard.set("FAKE_WD_VERSION", "webkit-cli 0.4.2");
+        guard.set("FAKE_WD_VERSION", "webkit-cli 0.5.0");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("launches.log");
         let bin = fake_webkit_cli(dir.path(), &log);
@@ -17144,8 +17152,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         )
         .await
         .unwrap_err();
-        assert!(err.contains("webkit-cli 0.4.2"), "{}", err);
-        assert!(err.contains("needs 0.5.0 or later"), "{}", err);
+        assert!(err.contains("webkit-cli 0.5.0"), "{}", err);
+        assert!(err.contains("needs 0.6.0 or later"), "{}", err);
         assert!(!log.exists(), "an old webkit-cli must not be started");
     }
 
@@ -17405,6 +17413,94 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         let ok = execute_command(&open("http://seq.test/slow?ms=300"), &mut state).await;
         assert_eq!(ok["success"], true, "{}", ok);
         assert_eq!(ok["data"]["url"], "http://seq.test/slow?ms=300", "{}", ok);
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    /// webkit-cli 0.6.0 delivers trusted input: hover, dblclick and modified
+    /// press reach the driver as W3C actions. A right-button click is refused
+    /// (left button only on macOS), and a click on a covered element names
+    /// the element on top and the fixes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_webkit_trusted_input_and_covered_click() {
+        if !python3_available() {
+            return;
+        }
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_WEBKIT_ACCOUNT",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_WEBKIT_ACCOUNT");
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, _launch, log) = launch_fake_webkit_with_limit(dir.path(), 5000).await;
+        let open = execute_command(
+            &json!({ "id": "o", "action": "navigate", "url": "http://ok.test/page" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(open["success"], true, "{}", open);
+
+        for cmd in [
+            json!({ "id": "h", "action": "hover", "selector": "#x" }),
+            json!({ "id": "d", "action": "dblclick", "selector": "#x" }),
+            json!({ "id": "p", "action": "press", "key": "Control+a" }),
+        ] {
+            let resp = execute_command(&cmd, &mut state).await;
+            assert_eq!(resp["success"], true, "{} -> {}", cmd, resp);
+        }
+        let sent: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("actions ").map(String::from))
+            .collect();
+        assert_eq!(sent.len(), 3, "{:?}", sent);
+        assert!(sent[0].contains("pointerMove"), "hover: {}", sent[0]);
+        assert_eq!(
+            sent[1].matches("pointerDown").count(),
+            2,
+            "dblclick: {}",
+            sent[1]
+        );
+        assert!(
+            sent[2].contains("keyDown") && sent[2].contains("\\ue009"),
+            "Control+a holds Control: {}",
+            sent[2]
+        );
+
+        let right = execute_command(
+            &json!({ "id": "r", "action": "click", "selector": "#x", "button": "right" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(right["success"], false, "{}", right);
+        assert!(
+            right["error"]
+                .as_str()
+                .unwrap()
+                .contains("only the left button on macOS"),
+            "{}",
+            right
+        );
+
+        let open = execute_command(
+            &json!({ "id": "o", "action": "navigate", "url": "http://covered.test/" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(open["success"], true, "{}", open);
+        let click = execute_command(
+            &json!({ "id": "c", "action": "click", "selector": "#covered" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(click["success"], false, "{}", click);
+        assert_eq!(
+            click["error"],
+            "Click on <button#covered \"Covered\"> did not reach it: <div#overlay.cookie-banner \"Accept cookies before the timeout\"> is covering it. Close or dismiss <div#overlay.cookie-banner \"Accept cookies before the timeout\"> (a cookie banner, modal or sticky header), scroll the target into view with `scrollintoview`, or run `snapshot -i` again and click a fresh ref.",
+            "{}",
+            click
+        );
         close_all_browser_backends(&mut state).await.unwrap();
     }
 

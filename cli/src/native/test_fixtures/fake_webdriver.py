@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 args = sys.argv[1:]
 if args[:1] == ["--version"]:
-    print(os.environ.get("FAKE_WD_VERSION", "webkit-cli 0.5.0"))
+    print(os.environ.get("FAKE_WD_VERSION", "webkit-cli 0.6.0"))
     sys.exit(0)
 if args[:1] == ["stop"]:
     # `webkit-cli stop --account NAME`
@@ -108,6 +108,12 @@ def execute(script, args=()):
             "now": now_ms(),
             "redirected": False,
         }
+    if "elementFromPoint" in script:
+        # The covered-click description on a "covered.test" page.
+        return {
+            "target": '<button#covered "Covered">',
+            "cover": '<div#overlay.cookie-banner "Accept cookies before the timeout">',
+        }
     if "__abOpts" in script:
         return ELEMENT if '"resolve"' in script else SNAPSHOT
     if "wanted = arguments[1]" in script:
@@ -190,7 +196,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(None)
         if self.path == "/session/%s/actions" % sid:
             state.setdefault("actions", []).append(data)
+            if os.environ.get("FAKE_WD_LOG"):
+                with open(os.environ["FAKE_WD_LOG"], "a") as log:
+                    log.write("actions %s\n" % json.dumps(data, sort_keys=True))
             return self.reply(None)
+        if self.path == "/session/%s/element/el-7/click" % sid and "covered.test" in state["url"]:
+            # webkit-cli 0.6.0: another element is on top of the target's center.
+            return self.reply(
+                {"error": "element click intercepted", "message": "element click intercepted"}, 400
+            )
         if self.path in ("/session/%s/element/el-7/click" % sid, "/session/%s/back" % sid):
             if "hang-later" in state["url"]:
                 time.sleep(3600)

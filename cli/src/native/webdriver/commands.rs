@@ -45,7 +45,6 @@ pub async fn execute(
     refs: &RefMap,
     timeout_ms: u64,
     url_matches: fn(&str, &str) -> bool,
-    provider: &str,
 ) -> Result<Value, String> {
     match action {
         "type" => {
@@ -67,12 +66,6 @@ pub async fn execute(
         }
         "press" => {
             let key = required(cmd, "key")?;
-            if provider == "webkit" && key != "+" && key.contains('+') {
-                return Err(format!(
-                    "press {} is not supported on -p webkit: webkit-cli does not apply held modifier keys yet; press the key without modifiers, or use eval",
-                    key
-                ));
-            }
             wb.perform_actions(key_chord_actions(key)?).await?;
             Ok(json!({ "pressed": key }))
         }
@@ -590,48 +583,6 @@ mod tests {
         assert!(key_chord_actions("Hyper+x")
             .unwrap_err()
             .contains("Unknown key 'Hyper'"));
-    }
-
-    #[tokio::test]
-    async fn webkit_refuses_modified_press_before_touching_the_driver() {
-        // Port 1 refuses connections: reaching the driver would be a different error.
-        let wb = WebDriverBackend::new(super::super::client::WebDriverClient::new_with_session(
-            1,
-            "s".to_string(),
-        ));
-        let refs = RefMap::new();
-        let err = execute(
-            "press",
-            &json!({ "key": "Control+a" }),
-            &wb,
-            &refs,
-            100,
-            |_, _| false,
-            "webkit",
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.contains("webkit-cli does not apply held modifier keys"),
-            "{}",
-            err
-        );
-        let other = execute(
-            "press",
-            &json!({ "key": "Control+a" }),
-            &wb,
-            &refs,
-            100,
-            |_, _| false,
-            "safari",
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            other.contains("Connection"),
-            "safari must try the driver: {}",
-            other
-        );
     }
 
     #[test]

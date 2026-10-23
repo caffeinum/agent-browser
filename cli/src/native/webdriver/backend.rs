@@ -73,6 +73,23 @@ pub struct Load {
 /// How long a command waits to learn whether a busy driver is free again.
 const BUSY_PROBE: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Describe a click target and the element on top of its center
+/// (`{ target, cover }`; `cover` is null when nothing else is there).
+const COVERING_JS: &str = "var el = arguments[0];
+function d(e) {
+  var s = e.tagName.toLowerCase();
+  if (e.id) s += '#' + e.id;
+  if (typeof e.className === 'string' && e.className.trim())
+    s += '.' + e.className.trim().split(/\\s+/).slice(0, 3).join('.');
+  var t = (e.innerText || e.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ');
+  if (t) s += ' \"' + (t.length > 40 ? t.slice(0, 40) + '...' : t) + '\"';
+  return '<' + s + '>';
+}
+var r = el.getBoundingClientRect();
+var top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+var cover = top && top !== el && !el.contains(top) ? d(top) : null;
+return { target: d(el), cover: cover };";
+
 impl WebDriverBackend {
     pub fn new(client: super::client::WebDriverClient) -> Self {
         Self {
@@ -345,12 +362,39 @@ impl WebDriverBackend {
             phrase: format!("navigation started by a click on {}", from),
             what: format!("the page opened by a click on {}", from),
         };
-        self.loading(
-            load,
-            self.client.limits().command,
-            self.client.click_element(element_id),
-        )
-        .await
+        let result = self
+            .loading(
+                load,
+                self.client.limits().command,
+                self.client.click_element(element_id),
+            )
+            .await;
+        match result {
+            Err(e) if e.contains("element click intercepted") => {
+                Err(self.covered_click_error(element_id).await.unwrap_or(e))
+            }
+            other => other,
+        }
+    }
+
+    /// webkit-cli 0.6.0 answers `element click intercepted` when another
+    /// element is on top of the target's center. Name both, and the fixes.
+    async fn covered_click_error(&self, element_id: &str) -> Option<String> {
+        let info = self
+            .execute_function_body(COVERING_JS, vec![super::dom_refs::element_arg(element_id)])
+            .await
+            .ok()?;
+        let target = info.get("target").and_then(Value::as_str)?;
+        Some(match info.get("cover").and_then(Value::as_str) {
+            Some(cover) => format!(
+                "Click on {} did not reach it: {} is covering it. Close or dismiss {} (a cookie banner, modal or sticky header), scroll the target into view with `scrollintoview`, or run `snapshot -i` again and click a fresh ref.",
+                target, cover, cover
+            ),
+            None => format!(
+                "Click on {} did not reach it: another element is covering it. Scroll it into view with `scrollintoview`, close any overlay, or run `snapshot -i` again and click a fresh ref.",
+                target
+            ),
+        })
     }
 
     pub async fn fill_element(&self, element_id: &str, value: &str) -> Result<(), String> {
@@ -488,26 +532,12 @@ const IOS_ONLY_ACTIONS: &[&str] = &["tap", "swipe", "device"];
 /// ("webkit", "safari", "ios"); otherwise the error to return. Actions that
 /// never touch the page (`skip_launch` ones) are not passed here.
 pub fn unsupported_on_webdriver(action: &str, provider: &str) -> Option<String> {
-    if provider == "webkit" {
-        if let Some(reason) = WEBKIT_CLI_INPUT_GAPS
-            .iter()
-            .find(|(a, _)| *a == action)
-            .map(|(_, r)| *r)
-        {
-            return Some(format!(
-                "{} is not supported on -p webkit: {}; workaround: eval",
-                command_name(action),
-                reason
-            ));
-        }
-    }
     let supported = all_supported().any(|(a, _)| a == action)
         || (provider == "ios" && IOS_ONLY_ACTIONS.contains(&action));
     if supported {
         return None;
     }
     let mut commands: Vec<&str> = all_supported()
-        .filter(|(a, _)| provider != "webkit" || !WEBKIT_CLI_INPUT_GAPS.iter().any(|(g, _)| g == a))
         .map(|(_, c)| c)
         .filter(|c| !c.is_empty())
         .collect();
@@ -527,20 +557,21 @@ pub fn unsupported_on_webdriver(action: &str, provider: &str) -> Option<String> 
     ))
 }
 
-/// webkit-cli 0.5.0 synthesizes input in the page (isTrusted=false): a
-/// pointer move sends no mouseover, a double press sends no dblclick, and
-/// held modifiers are not applied. Commands that depend on those are refused
-/// on webkit rather than reporting success the page never saw.
-pub const WEBKIT_CLI_INPUT_GAPS: &[(&str, &str)] = &[
-    (
-        "hover",
-        "webkit-cli does not send mouseover/mouseenter for pointer moves yet",
-    ),
-    (
-        "dblclick",
-        "webkit-cli does not send dblclick events for double presses yet",
-    ),
-];
+/// webkit-cli 0.6.0 sends trusted input through the OS event path, but on
+/// macOS it presses only the left mouse button. The WebDriver click path has
+/// no button, so a click asking for another one is refused on webkit instead
+/// of silently becoming a left click.
+pub fn refused_input_on_webkit(action: &str, cmd: &Value) -> Option<String> {
+    let button = cmd.get("button").and_then(Value::as_str).unwrap_or("left");
+    if matches!(action, "click" | "dblclick") && button != "left" {
+        return Some(format!(
+            "{} with the {} mouse button is not supported on -p webkit: webkit-cli presses only the left button on macOS; workaround: eval (e.g. dispatch a contextmenu event)",
+            command_name(action),
+            button
+        ));
+    }
+    None
+}
 
 /// Browser-level features WebDriver has no equivalent for.
 const NO_WORKAROUND: &[&str] = &[
@@ -666,6 +697,7 @@ pub fn command_name(action: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_supported_actions_pass_and_others_name_the_alternatives() {
@@ -692,20 +724,28 @@ mod tests {
     }
 
     #[test]
-    fn webkit_refuses_input_webkit_cli_cannot_deliver_but_safari_keeps_it() {
-        let err = unsupported_on_webdriver("hover", "webkit").unwrap();
+    fn webkit_supports_hover_and_dblclick_but_refuses_other_buttons() {
+        assert_eq!(unsupported_on_webdriver("hover", "webkit"), None);
+        assert_eq!(unsupported_on_webdriver("dblclick", "webkit"), None);
+        let list = unsupported_on_webdriver("tab_new", "webkit").unwrap();
+        assert!(list.contains("hover, dblclick"), "{}", list);
+
+        assert_eq!(refused_input_on_webkit("click", &json!({})), None);
+        assert_eq!(
+            refused_input_on_webkit("click", &json!({ "button": "left" })),
+            None
+        );
+        let err = refused_input_on_webkit("click", &json!({ "button": "right" })).unwrap();
         assert!(
-            err.contains("webkit-cli does not send mouseover"),
+            err.starts_with("click with the right mouse button is not supported on -p webkit"),
             "{}",
             err
         );
-        assert!(unsupported_on_webdriver("dblclick", "webkit")
-            .unwrap()
-            .contains("dblclick"));
-        assert_eq!(unsupported_on_webdriver("hover", "safari"), None);
-        assert_eq!(unsupported_on_webdriver("dblclick", "safari"), None);
-        assert!(!unsupported_on_webdriver("tab_new", "webkit")
-            .unwrap()
-            .contains("hover"));
+        assert!(err.contains("only the left button on macOS"), "{}", err);
+        assert!(refused_input_on_webkit("dblclick", &json!({ "button": "middle" })).is_some());
+        assert_eq!(
+            refused_input_on_webkit("hover", &json!({ "button": "right" })),
+            None
+        );
     }
 }
