@@ -3205,7 +3205,29 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
+    let webdriver_page_command = state.browser.is_none()
+        && state.webdriver_backend.is_some()
+        && super::webdriver::commands::ACTIONS
+            .iter()
+            .any(|(a, _)| *a == action);
     let result = match action {
+        _ if webdriver_page_command => {
+            let timeout_ms = state.timeout_ms(cmd);
+            match state.webdriver_backend {
+                Some(ref wb) => {
+                    super::webdriver::commands::execute(
+                        action,
+                        cmd,
+                        wb,
+                        &state.ref_map,
+                        timeout_ms,
+                        route_url_matches,
+                    )
+                    .await
+                }
+                None => Err("No WebDriver session".to_string()),
+            }
+        }
         "launch" => {
             let webmcp_enabled = cmd
                 .get("webmcp")
@@ -15989,6 +16011,100 @@ mod tests {
             handle_url(&state).await.unwrap()["url"],
             "https://example.com/kept"
         );
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
+    /// type, press, select, and get count/value through the daemon on a
+    /// WebDriver session (fake driver; the real run is in the PR evidence).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_webdriver_page_commands_use_webdriver_endpoints() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("launches.log");
+        let mut state = DaemonState::new();
+        launch_local_webdriver(&mut state, fake_local_spec("safari"), || {
+            spawn_fake_local_driver(&log)
+        })
+        .await
+        .unwrap();
+        let snap = execute_command(
+            &json!({ "id": "s", "action": "snapshot", "interactive": true }),
+            &mut state,
+        )
+        .await;
+        let tree = snap["data"]["snapshot"].as_str().unwrap().to_string();
+        let target = format!(
+            "@{}",
+            tree.split("ref=").nth(1).unwrap().trim_end_matches(']')
+        );
+        let typed = execute_command(
+            &json!({ "id": "t", "action": "type", "selector": target, "text": "Ada" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(typed["data"]["typed"], "Ada", "{}", typed);
+        let value = execute_command(
+            &json!({ "id": "v", "action": "inputvalue", "selector": target }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(value["data"]["value"], "Ada", "{}", value);
+        let cleared = execute_command(&json!({ "id": "t2", "action": "type", "selector": target, "text": "Bo", "clear": true }), &mut state).await;
+        assert_eq!(cleared["success"], true, "{}", cleared);
+        let value = execute_command(
+            &json!({ "id": "v2", "action": "inputvalue", "selector": target }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(value["data"]["value"], "Bo", "{}", value);
+
+        let pressed = execute_command(
+            &json!({ "id": "p", "action": "press", "key": "Enter" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(pressed["data"]["pressed"], "Enter", "{}", pressed);
+        let unknown = execute_command(
+            &json!({ "id": "p2", "action": "press", "key": "Hyper+x" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(unknown["success"], false, "{}", unknown);
+
+        let selected = execute_command(
+            &json!({ "id": "sel", "action": "select", "selector": target, "values": ["pro"] }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(selected["data"]["selected"], json!(["pro"]), "{}", selected);
+        let missing = execute_command(
+            &json!({ "id": "sel2", "action": "select", "selector": target, "values": ["nope"] }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(missing["success"], false, "{}", missing);
+        assert!(
+            missing["error"]
+                .as_str()
+                .unwrap()
+                .contains("no option [\"nope\"]"),
+            "{}",
+            missing
+        );
+
+        let count = execute_command(
+            &json!({ "id": "c", "action": "count", "selector": ".item" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(count["data"]["count"], 3, "{}", count);
         close_all_browser_backends(&mut state).await.unwrap();
     }
 

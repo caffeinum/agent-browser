@@ -58,10 +58,18 @@ SNAPSHOT = {
 }
 
 
-def execute(script):
+def execute(script, args=()):
     """Canned answers for agent-browser's DOM-walk scripts (no JS engine here)."""
     if "__abOpts" in script:
         return ELEMENT if '"resolve"' in script else SNAPSHOT
+    if "wanted = arguments[1]" in script:
+        # select: report options that do not exist
+        missing = [w for w in args[1] if w not in ("free", "pro")]
+        return "no option %s" % json.dumps(missing) if missing else None
+    if "querySelectorAll(arguments[0]).length" in script:
+        return 3
+    if "v == null ? '' : String(v)" in script:
+        return state.get("typed", "")
     if "innerText" in script:
         return "Save (clicked %d)" % state.get("clicks", 0)
     return None
@@ -115,7 +123,16 @@ class Handler(BaseHTTPRequestHandler):
             state["page_load_ms"] = data.get("pageLoad", state.get("page_load_ms"))
             return self.reply(None)
         if self.path == "/session/%s/execute/sync" % sid:
-            return self.reply(execute(data["script"]))
+            return self.reply(execute(data["script"], data.get("args", [])))
+        if self.path == "/session/%s/element/el-7/value" % sid:
+            state["typed"] = state.get("typed", "") + data["text"]
+            return self.reply(None)
+        if self.path == "/session/%s/element/el-7/clear" % sid:
+            state["typed"] = ""
+            return self.reply(None)
+        if self.path == "/session/%s/actions" % sid:
+            state.setdefault("actions", []).append(data)
+            return self.reply(None)
         if self.path in ("/session/%s/element/el-7/click" % sid, "/session/%s/back" % sid):
             if "hang-later" in state["url"]:
                 time.sleep(3600)

@@ -890,7 +890,7 @@ async fn test_daemon_state_new_with_corrupt_binding_does_not_pin() {
 #[tokio::test]
 async fn test_webdriver_sessions_refuse_unsupported_commands_by_name() {
     use super::actions::{skip_launch_action, BackendType};
-    use super::webdriver::backend::{WebDriverBackend, WEBDRIVER_SUPPORTED_ACTIONS};
+    use super::webdriver::backend::{all_supported, WebDriverBackend};
     use super::webdriver::client::WebDriverClient;
 
     let mut state = DaemonState::new();
@@ -906,9 +906,7 @@ async fn test_webdriver_sessions_refuse_unsupported_commands_by_name() {
 
     let mut refused = 0;
     for (i, action) in DOCUMENTED_ACTIONS.iter().enumerate() {
-        if skip_launch_action(action)
-            || WEBDRIVER_SUPPORTED_ACTIONS.iter().any(|(a, _)| a == action)
-        {
+        if skip_launch_action(action) || all_supported().any(|(a, _)| a == *action) {
             continue;
         }
         let cmd = minimal_command(action, &format!("wd-{}", i));

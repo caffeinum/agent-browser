@@ -247,6 +247,29 @@ impl WebDriverBackend {
         super::client::element_id_from_value(&value, "script", body).map(Some)
     }
 
+    pub async fn send_keys(&self, element_id: &str, text: &str) -> Result<(), String> {
+        self.client.send_keys(element_id, text).await
+    }
+
+    pub async fn clear_element(&self, element_id: &str) -> Result<(), String> {
+        self.client.clear_element(element_id).await
+    }
+
+    /// W3C input actions (pointer and key sequences), released afterwards.
+    pub async fn perform_actions(&self, actions: Value) -> Result<(), String> {
+        let sid = self
+            .client
+            .session_id_pub()
+            .ok_or("No active WebDriver session")?
+            .to_string();
+        self.client.execute_actions(&sid, &actions).await
+    }
+
+    /// The current URL (for results and polling).
+    pub async fn get_url_now(&self) -> Result<String, String> {
+        self.client.get_url().await
+    }
+
     pub async fn find_css(&self, selector: &str) -> Result<String, String> {
         self.client.find_element("css selector", selector).await
     }
@@ -384,6 +407,14 @@ pub const WEBDRIVER_SUPPORTED_ACTIONS: &[(&str, &str)] = &[
     ("cookies_get", "cookies"),
 ];
 
+/// Every action implemented on WebDriver sessions, with its CLI name.
+pub fn all_supported() -> impl Iterator<Item = (&'static str, &'static str)> {
+    WEBDRIVER_SUPPORTED_ACTIONS
+        .iter()
+        .chain(super::commands::ACTIONS.iter())
+        .copied()
+}
+
 /// iOS adds touch gestures through Appium.
 const IOS_ONLY_ACTIONS: &[&str] = &["tap", "swipe", "device"];
 
@@ -391,16 +422,13 @@ const IOS_ONLY_ACTIONS: &[&str] = &["tap", "swipe", "device"];
 /// ("webkit", "safari", "ios"); otherwise the error to return. Actions that
 /// never touch the page (`skip_launch` ones) are not passed here.
 pub fn unsupported_on_webdriver(action: &str, provider: &str) -> Option<String> {
-    let supported = WEBDRIVER_SUPPORTED_ACTIONS
-        .iter()
-        .any(|(a, _)| *a == action)
+    let supported = all_supported().any(|(a, _)| a == action)
         || (provider == "ios" && IOS_ONLY_ACTIONS.contains(&action));
     if supported {
         return None;
     }
-    let commands: Vec<&str> = WEBDRIVER_SUPPORTED_ACTIONS
-        .iter()
-        .map(|(_, c)| *c)
+    let commands: Vec<&str> = all_supported()
+        .map(|(_, c)| c)
         .filter(|c| !c.is_empty())
         .collect();
     Some(format!(
