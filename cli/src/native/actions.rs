@@ -15679,6 +15679,59 @@ mod tests {
         close_all_browser_backends(&mut state).await.unwrap();
     }
 
+    /// snapshot -> click @ref -> get text @ref through the daemon over a fake
+    /// WebDriver server that answers the DOM-walk scripts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_webdriver_snapshot_click_and_get_text_by_ref() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("launches.log");
+        let mut state = DaemonState::new();
+        launch_local_webdriver(&mut state, fake_local_spec("safari"), || {
+            spawn_fake_local_driver(&log)
+        })
+        .await
+        .unwrap();
+
+        let snap = execute_command(
+            &json!({ "id": "s", "action": "snapshot", "interactive": true }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(snap["success"], true, "{}", snap);
+        let tree = snap["data"]["snapshot"].as_str().unwrap();
+        assert!(tree.starts_with("- button \"Save\" [ref=e"), "{}", tree);
+        let ref_id = tree
+            .split("ref=")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(']')
+            .to_string();
+
+        let click = execute_command(
+            &json!({ "id": "c", "action": "click", "selector": format!("@{}", ref_id) }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(click["success"], true, "{}", click);
+
+        let text = execute_command(
+            &json!({ "id": "t", "action": "gettext", "selector": format!("@{}", ref_id) }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(text["success"], true, "{}", text);
+        assert_eq!(text["data"]["text"], "Save (clicked 1)");
+        close_all_browser_backends(&mut state).await.unwrap();
+    }
+
     /// A different identity replaces the session, and the old driver is
     /// stopped before the new one starts.
     #[cfg(unix)]

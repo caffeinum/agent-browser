@@ -1,28 +1,56 @@
 // DOM-walk accessibility snapshot for backends without a CDP AX tree.
-// Function body: expects `__abOpts` ({selector, urls}) and `__abCursorScan`
-// in scope. Returns {document, nodes, cursor, hrefs} where `nodes` are shaped
-// like CDP Accessibility.getFullAXTree nodes, so the Rust side feeds them to
-// the same tree builder and renderer as the CDP path. Elements are identified
-// by per-document ids kept in a WeakMap (no DOM mutation); refs resolve
-// through `window.__abById`.
-var opts = __abOpts || {};
+// Function body. Expects in scope:
+//   __abOpts = {key, selector, urls, resolve?: {id, role, name}}
+//   __abCursorScan (the shared cursor-interactive scan)
+// Snapshot mode returns {document, nodes, cursor, hrefs}, with `nodes` shaped
+// like CDP Accessibility.getFullAXTree output so the Rust side reuses the CDP
+// tree builder and renderer. Resolve mode returns the element for a ref, null
+// when it is gone, or a string describing why it no longer matches.
+var opts = __abOpts;
 var W = window;
+if (!opts || typeof opts.key !== 'string' || !opts.key) throw new Error('agent-browser DOM snapshot: missing registry key');
+
+// Per-document element registry. It lives under a key the daemon picks (the
+// page cannot know it in advance) as a non-enumerable, read-only,
+// non-configurable property with frozen accessors, and the page DOM is never
+// mutated. Resolution still re-checks role and name, so a page that patches
+// built-ins cannot silently redirect a ref to another element.
 var ID_SPAN = 4194304; // 2^22 ids per document salt; salt < 2^30 keeps ids below 2^53.
-if (!W.__abIds) {
-  W.__abIds = new WeakMap();
-  W.__abById = new Map();
-  W.__abSalt = 1 + Math.floor(Math.random() * 1073741823);
-  W.__abNext = 1;
+var registryDescriptor = Object.getOwnPropertyDescriptor(W, opts.key);
+var registry = registryDescriptor && registryDescriptor.value;
+if (!registry) {
+  registry = (function () {
+    var byElement = new WeakMap();
+    var byId = new Map();
+    var salt = 1 + Math.floor(Math.random() * 1073741823);
+    var next = 1;
+    var weak = typeof WeakRef === 'function';
+    return Object.freeze({
+      document: String(performance.timeOrigin) + ':' + salt,
+      idOf: function (el) {
+        var id = byElement.get(el);
+        if (id === undefined) {
+          id = salt * ID_SPAN + next++;
+          byElement.set(el, id);
+          byId.set(id, weak ? new WeakRef(el) : { deref: function () { return el; } });
+        }
+        return id;
+      },
+      get: function (id) {
+        var ref = byId.get(id);
+        return ref ? ref.deref() : undefined;
+      }
+    });
+  })();
+  Object.defineProperty(W, opts.key, { value: registry, enumerable: false, writable: false, configurable: false });
 }
-function idOf(el) {
-  var id = W.__abIds.get(el);
-  if (id === undefined) {
-    id = W.__abSalt * ID_SPAN + W.__abNext++;
-    W.__abIds.set(el, id);
-    W.__abById.set(id, typeof WeakRef === 'function' ? new WeakRef(el) : { deref: function () { return el; } });
-  }
-  return id;
-}
+var idOf = registry.idOf;
+
+// Per-call caches: every element's style and text alternative is computed
+// once, so name-from-content over nested tables stays linear in page size.
+var styleCache = new WeakMap();
+var pseudoCache = new WeakMap();
+var textCache = [new WeakMap(), new WeakMap()];
 
 var SKIP = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, TEMPLATE: 1, HEAD: 1, META: 1, LINK: 1, TITLE: 1, BR: 1, WBR: 1 };
 var SPACE_BREAKS = { BR: 1, WBR: 1 };
@@ -33,7 +61,11 @@ var ARIA_ROLES = { alert: 1, alertdialog: 1, application: 1, article: 1, banner:
 var TAG_ROLES = { BUTTON: 'button', TEXTAREA: 'textbox', OPTION: 'option', OPTGROUP: 'group', UL: 'list', OL: 'list', MENU: 'list', LI: 'listitem', NAV: 'navigation', MAIN: 'main', ASIDE: 'complementary', ARTICLE: 'article', TABLE: 'table', TR: 'row', P: 'paragraph', BLOCKQUOTE: 'blockquote', FIGURE: 'figure', FIGCAPTION: 'Figcaption', HR: 'separator', DIALOG: 'dialog', DETAILS: 'group', SUMMARY: 'DisclosureTriangle', LABEL: 'LabelText', IFRAME: 'Iframe', SUP: 'superscript', SUB: 'subscript', ABBR: 'Abbr', CODE: 'code', STRONG: 'strong', EM: 'emphasis', FIELDSET: 'group', LEGEND: 'legend', PROGRESS: 'progressbar', METER: 'meter', OUTPUT: 'status', SEARCH: 'search', FORM: 'form', CAPTION: 'caption', DL: 'list', DT: 'term', DD: 'definition', TIME: 'time', DEL: 'deletion', INS: 'insertion' };
 var INPUT_ROLES = { button: 'button', submit: 'button', reset: 'button', image: 'button', checkbox: 'checkbox', radio: 'radio', range: 'slider', number: 'spinbutton', search: 'searchbox', color: 'button', file: 'button' };
 
-function styleOf(el) { return W.getComputedStyle(el); }
+function styleOf(el) {
+  var style = styleCache.get(el);
+  if (!style) { style = W.getComputedStyle(el); styleCache.set(el, style); }
+  return style;
+}
 function isHidden(el) {
   if (el.hidden || el.getAttribute('aria-hidden') === 'true') return true;
   if (el.tagName === 'INPUT' && el.type === 'hidden') return true;
@@ -103,6 +135,12 @@ function isDataTable(table) {
   return result;
 }
 function pseudoText(el, which) {
+  var cached = pseudoCache.get(el);
+  if (!cached) { cached = {}; pseudoCache.set(el, cached); }
+  if (!(which in cached)) cached[which] = computePseudoText(el, which);
+  return cached[which];
+}
+function computePseudoText(el, which) {
   var content = W.getComputedStyle(el, which).content;
   if (!content || content === 'none' || content === 'normal') return '';
   // `content: "x" "y" / "alt"` exposes the alt text when present.
@@ -152,6 +190,12 @@ function contentText(node, inLabel) {
   return out;
 }
 function textAlternative(el, inLabel) {
+  var cache = textCache[inLabel ? 1 : 0];
+  var text = cache.get(el);
+  if (text === undefined) { text = computeTextAlternative(el, inLabel); cache.set(el, text); }
+  return text;
+}
+function computeTextAlternative(el, inLabel) {
   var aria = collapse(el.getAttribute('aria-label'));
   if (aria) return aria;
   var tag = el.tagName;
@@ -225,6 +269,26 @@ function valueOf(el, role) {
   return '';
 }
 
+// Resolve mode: the element behind a ref, verified against its snapshot role
+// and name. Hidden radio/checkbox promotion (LabelText/generic wrapping a
+// hidden input) and cursor-interactive text names are accepted as matches.
+function cursorText(el) { return (el.textContent || '').trim().slice(0, 100); }
+function resolveRef(want) {
+  var el = registry.get(want.id);
+  if (!el || !el.isConnected) return null;
+  var role = roleOf(el);
+  var promoted = (role === 'LabelText' || role === 'generic') && (want.role === 'radio' || want.role === 'checkbox');
+  if (role !== want.role && !promoted) {
+    return 'its element is now role=' + role + ', expected role=' + want.role;
+  }
+  var name = nameOf(el, role);
+  if (name !== want.name && cursorText(el) !== want.name && !(want.name === '' && !name)) {
+    return 'its element is now named ' + JSON.stringify(name) + ', expected ' + JSON.stringify(want.name);
+  }
+  return el;
+}
+if (opts.resolve) return resolveRef(opts.resolve);
+
 var nodes = [];
 var hrefs = {};
 function push(node) { node.nodeId = String(nodes.length); nodes.push(node); return node; }
@@ -292,4 +356,4 @@ for (var i = 0; i < cursorInfo.length; i++) {
   if (cursor[i] !== undefined) { cursorInfo[i].backendNodeId = cursor[i]; cursorOut.push(cursorInfo[i]); }
 }
 
-return { document: String(W.__abSalt), nodes: nodes, cursor: cursorOut, hrefs: hrefs };
+return { document: registry.document, nodes: nodes, cursor: cursorOut, hrefs: hrefs };

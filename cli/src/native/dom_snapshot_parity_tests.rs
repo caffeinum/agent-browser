@@ -1,11 +1,8 @@
-//! Parity between the CDP accessibility snapshot and the DOM-walk snapshot
-//! that WebDriver backends use, both taken from the same headless Chrome page.
+//! The DOM-walk snapshot that WebDriver backends use, checked inside real
+//! headless Chrome: parity with the CDP accessibility snapshot, page-side ref
+//! verification, and linear cost.
 //!
-//!   cargo test dom_snapshot_parity -- --ignored --test-threads=1
-//!
-//! `e2e_dom_snapshot_parity_report` compares arbitrary pages:
-//!   AB_PARITY_URLS=https://a,https://b AB_PARITY_OUT=/dir cargo test \
-//!     e2e_dom_snapshot_parity_report -- --ignored --nocapture
+//!   cargo test dom_snapshot -- --ignored --test-threads=1
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
@@ -34,7 +31,7 @@ fn normalize_refs(tree: &str) -> String {
     out
 }
 
-async fn launch(state: &mut DaemonState) {
+async fn open_html(state: &mut DaemonState, html: &str) {
     data(
         &execute_command(
             &json!({ "id": "1", "action": "launch", "headless": true }),
@@ -42,9 +39,7 @@ async fn launch(state: &mut DaemonState) {
         )
         .await,
     );
-}
-
-async fn navigate(state: &mut DaemonState, url: &str) {
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
     data(
         &execute_command(
             &json!({ "id": "2", "action": "navigate", "url": url }),
@@ -54,116 +49,188 @@ async fn navigate(state: &mut DaemonState, url: &str) {
     );
 }
 
-async fn snapshots(state: &mut DaemonState, interactive: bool) -> (String, String) {
+async fn eval(state: &DaemonState, expression: &str) -> Value {
+    state
+        .browser
+        .as_ref()
+        .unwrap()
+        .evaluate(expression, None)
+        .await
+        .unwrap_or_else(|e| panic!("evaluation failed: {}", e))
+}
+
+/// Runs a WebDriver-style function body in Chrome.
+fn as_expression(body: &str) -> String {
+    format!("(function() {{\n{}\n}})()", body)
+}
+
+async fn dom_snapshot(state: &DaemonState, options: &SnapshotOptions, refs: &mut RefMap) -> String {
+    let result = eval(
+        state,
+        &as_expression(&snapshot::dom_snapshot_script(options)),
+    )
+    .await;
+    snapshot::render_dom_snapshot(snapshot::parse_dom_snapshot(result).unwrap(), options, refs)
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_dom_snapshot_parity_fixture_interactive() {
+    let mut state = DaemonState::new();
+    open_html(
+        &mut state,
+        include_str!("test_fixtures/dom_snapshot_parity.html"),
+    )
+    .await;
+
     let cdp = data(
         &execute_command(
-            &json!({ "id": "3", "action": "snapshot", "interactive": interactive }),
-            state,
+            &json!({ "id": "3", "action": "snapshot", "interactive": true }),
+            &mut state,
         )
         .await,
     )["snapshot"]
         .as_str()
         .unwrap()
         .to_string();
-
     let options = SnapshotOptions {
-        interactive,
+        interactive: true,
         ..Default::default()
     };
-    let script = format!(
-        "(function() {{\n{}\n}})()",
-        snapshot::dom_snapshot_script(&options)
-    );
-    let result = state
-        .browser
-        .as_ref()
-        .unwrap()
-        .evaluate(&script, None)
-        .await
-        .expect("DOM-walk snapshot script failed in Chrome");
-    let dom = snapshot::render_dom_snapshot(
-        snapshot::parse_dom_snapshot(result).unwrap(),
-        &options,
-        &mut RefMap::new(),
-    );
-    (normalize_refs(&cdp), normalize_refs(&dom))
-}
+    let dom = dom_snapshot(&state, &options, &mut RefMap::new()).await;
+    let (cdp, dom) = (normalize_refs(&cdp), normalize_refs(&dom));
 
-struct DiffStats {
-    only_cdp: Vec<String>,
-    only_dom: Vec<String>,
-}
-
-fn diff_lines(cdp: &str, dom: &str) -> DiffStats {
-    let diff = TextDiff::from_lines(cdp, dom);
-    let mut stats = DiffStats {
-        only_cdp: Vec::new(),
-        only_dom: Vec::new(),
-    };
-    for change in diff.iter_all_changes() {
-        let line = change.value().trim_end().to_string();
-        match change.tag() {
-            ChangeTag::Delete => stats.only_cdp.push(line),
-            ChangeTag::Insert => stats.only_dom.push(line),
-            ChangeTag::Equal => {}
-        }
-    }
-    stats
-}
-
-#[tokio::test]
-#[ignore]
-async fn e2e_dom_snapshot_parity_fixture_interactive() {
-    let html = include_str!("test_fixtures/dom_snapshot_parity.html");
-    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
-    let mut state = DaemonState::new();
-    launch(&mut state).await;
-    navigate(&mut state, &url).await;
-
-    let (cdp, dom) = snapshots(&mut state, true).await;
-    let stats = diff_lines(&cdp, &dom);
+    let diff = TextDiff::from_lines(&cdp, &dom);
+    let changed: Vec<String> = diff
+        .iter_all_changes()
+        .filter(|c| c.tag() != ChangeTag::Equal)
+        .map(|c| {
+            format!(
+                "{}{}",
+                if c.tag() == ChangeTag::Delete {
+                    "-"
+                } else {
+                    "+"
+                },
+                c.value()
+            )
+        })
+        .collect();
     assert!(
-        stats.only_cdp.is_empty() && stats.only_dom.is_empty(),
-        "DOM-walk -i snapshot differs from CDP.\n--- CDP\n{}\n--- DOM walk\n{}\n--- only CDP\n{}\n--- only DOM\n{}",
-        cdp,
-        dom,
-        stats.only_cdp.join("\n"),
-        stats.only_dom.join("\n")
+        changed.is_empty(),
+        "DOM-walk -i snapshot differs from CDP (- CDP, + DOM walk):\n{}",
+        changed.join("")
     );
     data(&execute_command(&json!({ "id": "9", "action": "close" }), &mut state).await);
 }
 
+/// What the page-side resolver returns for a ref: "element:<TAG>", "gone",
+/// or the mismatch reason.
+async fn resolve(state: &DaemonState, refs: &RefMap, ref_id: &str) -> String {
+    let entry = refs.get(ref_id).unwrap();
+    let body =
+        snapshot::dom_resolve_script(entry.backend_node_id.unwrap(), &entry.role, &entry.name);
+    let probe = format!(
+        "(function() {{ var r = {}; return r === null ? 'gone' : typeof r === 'string' ? r : 'element:' + r.tagName; }})()",
+        as_expression(&body)
+    );
+    eval(state, &probe).await.as_str().unwrap().to_string()
+}
+
+fn ref_named(refs: &RefMap, role: &str, name: &str) -> String {
+    refs.entries_sorted()
+        .into_iter()
+        .find(|(_, e)| e.role == role && e.name == name)
+        .map(|(id, _)| id)
+        .unwrap_or_else(|| panic!("no ref for {} {:?}", role, name))
+}
+
 #[tokio::test]
 #[ignore]
-async fn e2e_dom_snapshot_parity_report() {
-    let Ok(urls) = std::env::var("AB_PARITY_URLS") else {
-        return;
-    };
-    let out_dir = std::env::var("AB_PARITY_OUT").expect("AB_PARITY_OUT is required");
-    std::fs::create_dir_all(&out_dir).unwrap();
+async fn e2e_dom_snapshot_refs_are_verified_in_the_page() {
     let mut state = DaemonState::new();
-    launch(&mut state).await;
-    for (i, url) in urls.split(',').enumerate() {
-        navigate(&mut state, url).await;
-        for interactive in [true, false] {
-            let (cdp, dom) = snapshots(&mut state, interactive).await;
-            let mode = if interactive { "i" } else { "full" };
-            std::fs::write(format!("{}/{}-{}-cdp.txt", out_dir, i, mode), &cdp).unwrap();
-            std::fs::write(format!("{}/{}-{}-dom.txt", out_dir, i, mode), &dom).unwrap();
-            let stats = diff_lines(&cdp, &dom);
-            println!(
-                "{} [{}] cdp: {} lines {} bytes | dom: {} lines {} bytes | only-cdp {} lines, only-dom {} lines",
-                url,
-                mode,
-                cdp.lines().count(),
-                cdp.len(),
-                dom.lines().count(),
-                dom.len(),
-                stats.only_cdp.len(),
-                stats.only_dom.len()
-            );
-        }
+    open_html(
+        &mut state,
+        r#"<button id="save">Save</button><button id="other">Other</button>"#,
+    )
+    .await;
+    let mut refs = RefMap::new();
+    dom_snapshot(&state, &SnapshotOptions::default(), &mut refs).await;
+    let save = ref_named(&refs, "button", "Save");
+
+    assert_eq!(resolve(&state, &refs, &save).await, "element:BUTTON");
+
+    // A page that patches built-ins to redirect lookups is caught by the
+    // role/name re-check rather than clicking the wrong element.
+    eval(
+        &state,
+        "(() => { const other = document.getElementById('other'); \
+         Map.prototype.get = function () { return { deref: () => other }; }; \
+         WeakMap.prototype.get = function () { return undefined; }; return true; })()",
+    )
+    .await;
+    let redirected = resolve(&state, &refs, &save).await;
+    assert!(redirected.contains("named \"Other\""), "{}", redirected);
+
+    // Reload restores built-ins; a renamed element no longer matches.
+    data(&execute_command(&json!({ "id": "r", "action": "reload" }), &mut state).await);
+    let mut refs = RefMap::new();
+    dom_snapshot(&state, &SnapshotOptions::default(), &mut refs).await;
+    let save = ref_named(&refs, "button", "Save");
+    eval(
+        &state,
+        "document.getElementById('save').textContent = 'Delete'",
+    )
+    .await;
+    let renamed = resolve(&state, &refs, &save).await;
+    assert!(renamed.contains("expected \"Save\""), "{}", renamed);
+
+    eval(&state, "document.getElementById('save').remove()").await;
+    assert_eq!(resolve(&state, &refs, &save).await, "gone");
+
+    // The registry is not enumerable on window.
+    let leaked = eval(
+        &state,
+        "Object.keys(window).filter(k => k.startsWith('__ab')).length",
+    )
+    .await;
+    assert_eq!(leaked, json!(0));
+    data(&execute_command(&json!({ "id": "9", "action": "close" }), &mut state).await);
+}
+
+/// Name-from-content over nested tables must not recompute styles for every
+/// ancestor: each element's style is read a bounded number of times.
+#[tokio::test]
+#[ignore]
+async fn e2e_dom_snapshot_style_lookups_stay_linear() {
+    let mut html = String::new();
+    for _ in 0..25 {
+        html.push_str("<table><tr><th>h</th><td>cell text <a href='#'>link</a>");
     }
+    for _ in 0..25 {
+        html.push_str("</td></tr></table>");
+    }
+    let mut state = DaemonState::new();
+    open_html(&mut state, &html).await;
+    eval(
+        &state,
+        "(() => { window.__calls = 0; const orig = window.getComputedStyle; \
+         window.getComputedStyle = function (...a) { window.__calls++; return orig.apply(this, a); }; \
+         return true; })()",
+    )
+    .await;
+    dom_snapshot(&state, &SnapshotOptions::default(), &mut RefMap::new()).await;
+    let calls = eval(&state, "window.__calls").await.as_u64().unwrap();
+    let elements = eval(&state, "document.querySelectorAll('*').length")
+        .await
+        .as_u64()
+        .unwrap();
+    assert!(
+        calls <= elements * 6,
+        "{} getComputedStyle calls for {} elements",
+        calls,
+        elements
+    );
     data(&execute_command(&json!({ "id": "9", "action": "close" }), &mut state).await);
 }
 

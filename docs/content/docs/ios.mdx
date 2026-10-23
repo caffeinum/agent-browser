@@ -170,6 +170,8 @@ agent-browser -p ios --device "John's iPhone" open https://example.com
 
 ## Differences from desktop
 
+`snapshot`, `click`, `fill`, and `get text` accept `@ref` selectors. Each ref is re-checked against its snapshot role and name before use. `eval` evaluates an expression and returns its value, as on Chrome.
+
 <table>
   <thead>
     <tr><th>Feature</th><th>Desktop</th><th>iOS</th></tr>
@@ -180,6 +182,7 @@ agent-browser -p ios --device "John's iPhone" open https://example.com
     <tr><td>PDF export</td><td>Supported</td><td>Not supported</td></tr>
     <tr><td>Screencast</td><td>Supported</td><td>Not supported</td></tr>
     <tr><td>Swipe gestures</td><td>Not native</td><td>Native support</td></tr>
+    <tr><td>Snapshots</td><td>Accessibility tree</td><td>Computed in the page from the DOM; same format and refs, iframes not expanded</td></tr>
   </tbody>
 </table>
 

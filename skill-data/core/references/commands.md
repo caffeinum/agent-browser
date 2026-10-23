@@ -568,4 +568,6 @@ AGENT_BROWSER_ALLOWED_DOMAINS="example.com"  # Restrict network domains; require
 AGENT_BROWSER_PLUGINS='[{"name":"vault","command":"agent-browser-plugin-vault","capabilities":["credential.read"]},{"name":"stealth","command":"agent-browser-plugin-stealth","capabilities":["launch.mutate"]}]'
 ```
 
+WebDriver sessions (iOS, Safari): `snapshot`, `click`/`fill`/`get text @eN` work with the same snapshot format and refs as Chrome (computed from the DOM; iframes are not expanded). `eval` takes an expression, not a function body.
+
 Browser Use Cloud lifecycle: setup is bounded to 18s plus up to 4s for timeout cleanup (10s create, 8s CDP attach, 4s stop). `close` succeeds only after the Cloud session acknowledges it stopped; a failed stop returns an error, keeps the session id for retrying `close`, and blocks a new launch until released. If create fails before an id arrives, the outcome is unknown; inspect the Browser Use Cloud dashboard before retrying. If the daemon exits before a successful stop, inspect and stop the browser in Cloud.

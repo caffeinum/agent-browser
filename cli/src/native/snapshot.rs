@@ -1487,12 +1487,34 @@ pub(crate) const DOM_SNAPSHOT_SCOPE: &str = "dom-walk";
 
 /// Function body (WebDriver execute/sync shape) that returns the DOM walk.
 pub(crate) fn dom_snapshot_script(options: &SnapshotOptions) -> String {
+    dom_script(serde_json::json!({
+        "key": dom_registry_key(),
+        "selector": options.selector,
+        "urls": options.urls,
+    }))
+}
+
+/// Function body returning the element behind a DOM-walk ref: the element,
+/// null when it is gone, or a string saying why it no longer matches.
+pub(crate) fn dom_resolve_script(id: i64, role: &str, name: &str) -> String {
+    dom_script(serde_json::json!({
+        "key": dom_registry_key(),
+        "resolve": { "id": id, "role": role, "name": name },
+    }))
+}
+
+fn dom_script(opts: Value) -> String {
     format!(
         "var __abCursorScan = {};\nvar __abOpts = {};\n{}",
-        CURSOR_SCAN_FN,
-        serde_json::json!({ "selector": options.selector, "urls": options.urls }),
-        DOM_SNAPSHOT_JS
+        CURSOR_SCAN_FN, opts, DOM_SNAPSHOT_JS
     )
+}
+
+/// Window property holding the page-side element registry. Random per daemon
+/// process, so a page cannot pre-plant or anticipate it.
+fn dom_registry_key() -> &'static str {
+    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| format!("__ab_{}", uuid::Uuid::new_v4().simple()))
 }
 
 #[derive(serde::Deserialize)]
